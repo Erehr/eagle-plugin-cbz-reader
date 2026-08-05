@@ -6,19 +6,80 @@
  */
 (function () {
     const pathModule = require('path');
+    const urlModule = require('url');
+
+    /**
+     * Absolute path → file:// URL.
+     *
+     * Hand-rolling this ('file:///' + backslash swap) breaks in two ways:
+     *   - on macOS the path already starts with '/', so you get file:////Users/…
+     *   - any '#', '?' or '%' in a page filename truncates or corrupts the URL,
+     *     on every platform.
+     * pathToFileURL handles the separator, the leading slash and the escaping.
+     */
+    function toFileURL(absPath) {
+        try {
+            return urlModule.pathToFileURL(absPath).href;
+        } catch (_) {
+            // Last-ditch fallback for anything pathToFileURL rejects
+            const p = absPath.replace(/\\/g, '/');
+            return 'file://' + (p.startsWith('/') ? '' : '/') + encodeURI(p);
+        }
+    }
+
+    /** file:// URL (or plain path) → absolute path, on either platform. */
+    function fromFileURL(value) {
+        if (!/^file:\/\//i.test(value)) return value;
+        try {
+            return urlModule.fileURLToPath(value);
+        } catch (_) {
+            let p = value.replace(/^file:\/\//i, '');
+            try { p = decodeURIComponent(p); } catch (_) { }
+            // Windows gives '/C:/x'; POSIX must keep its leading slash
+            return /^\/[A-Za-z]:/.test(p) ? p.slice(1) : p;
+        }
+    }
+
     const urlParams = new URLSearchParams(window.location.search);
     const fileId = urlParams.get('id') || '';
-    let filePath = urlParams.get('path') || '';
-    if (filePath.startsWith('file://')) {
-        filePath = filePath.replace(/^file:\/\/\//, '').replace(/^file:\/\//, '');
-        try { filePath = decodeURIComponent(filePath); } catch (_) { }
-    }
-    filePath = pathModule.normalize(filePath);
+    let filePath = pathModule.normalize(fromFileURL(urlParams.get('path') || ''));
 
-    // Check if sharp is successfully loaded
-    let sharp;
-    try { sharp = require('sharp'); } catch (e) { console.error('Failed to load sharp', e); sharp = null; }
-    filePath = pathModule.normalize(filePath);
+    /**
+     * ── Stale viewer guard ──────────────────────────────────────────────
+     * Eagle sometimes reuses the preview host for the next archive without the
+     * page actually re-executing (window reuse / back-forward cache). When that
+     * happens this script never reruns, so the previously opened comic stays on
+     * screen even though a different file was requested — which is exactly the
+     * "it opened the previous one" symptom.
+     *
+     * We snapshot the query we booted with and reload if it ever changes, or if
+     * the page is restored from bfcache. Both checks are no-ops in the normal
+     * case, so this costs nothing when things work correctly.
+     */
+    const bootSearch = window.location.search;
+    let reloadArmed = true;
+    function reloadIfArchiveChanged(reason) {
+        if (!reloadArmed) return;
+        if (window.location.search === bootSearch) return;
+        reloadArmed = false;
+        console.warn('[cbz-reader] viewer reused for a different archive (' + reason + ') – reloading');
+        try { archiveUtil.cleanup(filePath, sessionToken); } catch (_) { }
+        window.location.reload();
+    }
+    window.addEventListener('pageshow', e => {
+        if (e.persisted) {
+            reloadArmed = false;
+            window.location.reload();
+        }
+    });
+    window.addEventListener('popstate', () => reloadIfArchiveChanged('popstate'));
+    window.addEventListener('hashchange', () => reloadIfArchiveChanged('hashchange'));
+    window.addEventListener('focus', () => reloadIfArchiveChanged('focus'));
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) reloadIfArchiveChanged('visibilitychange');
+    });
+    setInterval(() => reloadIfArchiveChanged('poll'), 750);
+
     const theme = (urlParams.get('theme') || 'dark').toLowerCase();
     document.documentElement.setAttribute('theme', theme === 'light' ? 'light' : 'dark');
 
@@ -30,8 +91,9 @@
     const pageSlider = document.getElementById('page-slider');
     const btnPrev = document.getElementById('btn-prev');
     const btnNext = document.getElementById('btn-next');
-    const modeSingle = document.getElementById('mode-single');
-    const modeDouble = document.getElementById('mode-double');
+    const pagesToggle = document.getElementById('pages-toggle');
+    const pagesSingleIcon = document.getElementById('pages-single-icon');
+    const pagesDoubleIcon = document.getElementById('pages-double-icon');
     const continuousToggle = document.getElementById('continuous-toggle');
     const toolbar = document.getElementById('toolbar');
     const scrollWidthLabel = document.getElementById('scroll-width-label');
@@ -46,8 +108,6 @@
     const transitionSpeedLabel = document.getElementById('transition-speed-label');
     const dirLtrIcon = document.getElementById('dir-ltr-icon');
     const dirRtlIcon = document.getElementById('dir-rtl-icon');
-    const zoomInBtn = document.getElementById('zoom-in');
-    const zoomOutBtn = document.getElementById('zoom-out');
     const zoomResetBtn = document.getElementById('zoom-reset');
     const zoomLabel = document.getElementById('zoom-label');
     const contentEl = document.getElementById('content');
@@ -73,6 +133,21 @@
     let currentIndex = 1;
     /** Scroll mode: position of each image. imagesFullPosition[imageIndex] = { top, center, bottom, height } */
     let imagesFullPosition = {};
+    /** Same data as a dense array ordered by index, for binary search during scroll */
+    let posList = [];
+
+    /** Index of the last page whose `top` is <= y (or 0). Assumes posList is sorted by top. */
+    function findIndexAtOffset(y) {
+        let lo = 0, hi = posList.length - 1, best = 0;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const p = posList[mid];
+            if (!p) { lo = mid + 1; continue; }
+            if (p.top <= y) { best = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        return best;
+    }
     let rightSize = { width: 0, height: 0, scrollHeight: 0 };
     let slideTrackTotalW = 0;
 
@@ -107,6 +182,25 @@
     const DEFAULT_ASPECT = 0.69;
 
     const archiveUtil = require('../js/archive-util.js');
+    const VIDEO_EXT_SET = new Set(archiveUtil.VIDEO_EXT.map(e => e.toLowerCase()));
+
+    /**
+     * Identity of the archive session this viewer opened. Passed back to cleanup()
+     * so a viewer closing late can never delete the temp files of a viewer that
+     * has already reopened the same archive.
+     */
+    let sessionToken = null;
+
+    function isVideoEntry(index) {
+        const name = imageNames[index] || '';
+        const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
+        return VIDEO_EXT_SET.has(ext);
+    }
+
+    function isVideoPath(fp) {
+        const ext = fp.substring(fp.lastIndexOf('.')).toLowerCase();
+        return VIDEO_EXT_SET.has(ext);
+    }
 
 
 
@@ -119,15 +213,18 @@
     function loadImageSrc(index) {
         return archiveUtil.getImagePath(filePath, index).then(fp => {
             if (!fp) throw new Error('No path for page ' + index);
-            const dims = archiveUtil.getImageDimensions(filePath, [index]);
-            if (dims && dims[0] && dims[0].width > 0) {
-                imagesData[index] = {
-                    width: dims[0].width,
-                    height: dims[0].height,
-                    aspectRatio: dims[0].width / dims[0].height
-                };
+            // Skip dimension update for video entries — their real dims come from loadedmetadata
+            if (!isVideoEntry(index)) {
+                const dims = archiveUtil.getImageDimensions(filePath, [index]);
+                if (dims && dims[0] && dims[0].width > 0) {
+                    imagesData[index] = {
+                        width: dims[0].width,
+                        height: dims[0].height,
+                        aspectRatio: dims[0].width / dims[0].height
+                    };
+                }
             }
-            return 'file:///' + fp.replace(/\\/g, '/');
+            return toFileURL(fp);
         });
     }
 
@@ -159,12 +256,24 @@
         indexNum = pagesPerView === 2 ? getSpreadCount(n) : n;
     }
 
-    // Build DOM: one .r-flex per image, same for all modes
+    /**
+     * Cached element lists. These are rebuilt only when the track is rebuilt, which
+     * removes a pile of querySelectorAll() calls from the navigation / scroll / preload
+     * paths — those ran on every event and walked the whole track each time.
+     */
+    let rFlexEls = [];
+    let mediaEls = [];
+
+    // Build DOM: one .r-flex per image/video, same for all modes
     function addHtmlImages() {
         const n = imageNames.length;
 
         readingTrack.innerHTML = '';
         readingTrack.className = '';
+        rFlexEls = new Array(n);
+        mediaEls = new Array(n);
+
+        const frag = document.createDocumentFragment();
 
         for (let i = 0; i < n; i++) {
             const rFlex = document.createElement('div');
@@ -175,18 +284,41 @@
             rImg.className = 'r-img r-img-i' + i;
             rImg.dataset.index = String(i);
             const wrap = document.createElement('div');
-            const img = document.createElement('img');
-            img.alt = '';
-            img.dataset.index = String(i);
-            img.loading = 'eager';
-            img.decoding = 'async';
-            wrap.appendChild(img);
+
+            if (isVideoEntry(i)) {
+                // Video entry: create a <video> that loops silently with no controls
+                const vid = document.createElement('video');
+                vid.dataset.index = String(i);
+                vid.dataset.isVideo = '1';
+                vid.autoplay = true;
+                vid.loop = true;
+                vid.muted = true;
+                vid.playsInline = true;
+                vid.controls = false;
+                vid.preload = 'none';
+                wrap.appendChild(vid);
+                mediaEls[i] = vid;
+            } else {
+                const img = document.createElement('img');
+                img.alt = '';
+                img.dataset.index = String(i);
+                img.loading = 'eager';
+                img.decoding = 'async';
+                wrap.appendChild(img);
+                mediaEls[i] = img;
+            }
+
             rImg.appendChild(wrap);
             rFlex.appendChild(rImg);
-            readingTrack.appendChild(rFlex);
+            rFlexEls[i] = rFlex;
+            frag.appendChild(rFlex);
         }
 
+        // One reflow for the whole track instead of one per page
+        readingTrack.appendChild(frag);
+
         readingTrack.classList.toggle('track-has-gap', scrollGap);
+        hasAnimatedImages = false;
         lazyLoadObserver();
     }
 
@@ -238,9 +370,14 @@
                 scheduleDisposeAfterLoad();
                 return;
             }
+            // Loads firm up placeholder aspect ratios into real ones, so page
+            // heights shift under the reader. Hold the anchor across the
+            // recalculation or the strip slides while they are reading it.
+            const anchor = captureScrollAnchor();
             disposeImages();
             if (continuous) {
                 calculateView(false);
+                restoreScrollAnchor(anchor);
                 if (haveZoom) applyScale(currentScale, false);
             }
         }, continuous ? 150 : 16);
@@ -279,84 +416,200 @@
         return imageWidth;
     }
 
-    /** Set the source of an image natively, followed by a sharp downsample if applicable */
-    async function smartLoadImage(img, absolutePath, taskEpoch) {
-        const oldBlob = img.dataset.blobUrl;
-        let newBlobUrl = '';
+    /** True when a page is big enough that downscaling for display is worthwhile. */
+    function shouldDownsample(displayWidthCss, imageIndex) {
+        if (!displayWidthCss || displayWidthCss <= 0) return false;
+        const dpr = window.devicePixelRatio || 1;
+        const pxWidth = Math.round(displayWidthCss * dpr);
+        if (imageIndex !== undefined && !isNaN(imageIndex)) {
+            const d = imagesData[imageIndex];
+            // Skip when already near native resolution — re-encoding would only
+            // cost time and add generation loss
+            if (d && d.width > 0 && pxWidth >= d.width * 0.95) return false;
+        }
+        return true;
+    }
 
+    /** Set the source of a video element */
+    async function smartLoadVideo(vid, absolutePath, taskEpoch) {
+        // Use dataset.loaded as the guard — NOT vid.src.
+        // Chromium resolves the .src *property* to the page base URL when the src
+        // *attribute* is an empty string (set by purgeRenderCache), making `if (vid.src)`
+        // always truthy and preventing the video from ever loading after purge.
+        if (vid.dataset.loaded === '1') return;
+
+        const url = toFileURL(absolutePath);
+
+        // Final safety abort before mutating DOM
+        if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
+
+        // Listen for real dimensions once the browser parses the video header.
+        // This fires quickly (no need to decode any video frames) and gives us the
+        // true AR so we can reflow the layout beyond the 16:9 Node-side placeholder.
+        vid.addEventListener('loadedmetadata', () => {
+            const vw = vid.videoWidth;
+            const vh = vid.videoHeight;
+            if (vw && vh) {
+                const idx = parseInt(vid.dataset.index, 10);
+                if (!isNaN(idx)) {
+                    imagesData[idx] = { width: vw, height: vh, aspectRatio: vw / vh };
+                }
+                // Recompute layout now that we have the real aspect ratio
+                disposeImages();
+                if (continuous) calculateView(false);
+            }
+        }, { once: true });
+
+        vid.src = url;
+        vid.load();
+
+        // Only auto-play if this video is in the currently visible spread.
+        // Preloaded videos start paused to avoid decoding dozens of videos simultaneously.
+        const vidIdx = parseInt(vid.dataset.index, 10);
+        const currentSpread = getSpreadAt(currentIndex - 1) || [];
+        const isCurrentSpread = !isNaN(vidIdx) && currentSpread.some(s => s.index === vidIdx);
+        if (isCurrentSpread) {
+            vid.play().catch(() => { });
+        }
+
+        vid.dataset.loaded = '1';
+
+        // Initial layout pass with placeholder AR (will be corrected by loadedmetadata above)
+        requestAnimationFrame(() => { disposeImages(); });
+    }
+
+    /**
+     * Pause all video elements that are NOT in the current visible spread,
+     * and resume the one(s) that ARE. Called on every page-change event.
+     */
+    function syncVideoPlayback() {
+        const currentSpread = getSpreadAt(currentIndex - 1) || [];
+        const currentIndices = new Set(currentSpread.map(s => s.index));
+
+        for (let idx = 0, len = mediaEls.length; idx < len; idx++) {
+            const vid = mediaEls[idx];
+            if (!vid || vid.tagName !== 'VIDEO') continue;
+            if (vid.dataset.loaded !== '1') continue; // not yet loaded, skip
+
+            if (currentIndices.has(idx)) {
+                if (vid.paused) vid.play().catch(() => { });
+            } else {
+                if (!vid.paused) vid.pause();
+            }
+        }
+    }
+
+    /**
+     * Produce (or reuse) a downscaled copy of a page at `pxWidth` via Sharp.
+     *
+     * archive-util's renderAtScale owns the on-disk cache (keyed by page and
+     * width bucket, bounded/evicted there). That cache is what makes revisiting
+     * a page, flipping back and forth, or toggling layout modes cheap — those
+     * paths would otherwise force a fresh Sharp resize for every visible page.
+     *
+     * Returns the *original* file when resizing is pointless — because the page
+     * is animated, or because the requested width is close enough to native that
+     * a re-encode would cost time and lose quality for nothing.
+     *
+     * @returns {Promise<{url: string, native: boolean}|null>}
+     */
+    async function renderPageAtWidth(index, pxWidth) {
+        const originalPath = await archiveUtil.getImagePath(filePath, index);
+        if (!originalPath) return null;
+        try {
+            const scaledPath = await archiveUtil.renderAtScale(filePath, index, pxWidth);
+            if (!scaledPath) return { url: toFileURL(originalPath), native: true };
+            return { url: toFileURL(scaledPath), native: scaledPath === originalPath };
+        } catch (err) {
+            console.error('renderPageAtWidth failed for page ' + index + ':', err);
+            return { url: toFileURL(originalPath), native: true };
+        }
+    }
+
+    /**
+     * In-flight render requests, keyed by page + width bucket.
+     *
+     * Without this, a single zoom gesture launches a fresh full-size resize on
+     * every settle of the debounce, so several multi-hundred-megabyte jobs
+     * for the same page run concurrently and starve each other. Collapsing them
+     * means the second caller simply awaits the first.
+     */
+    const renderInFlight = new Map();
+
+    function renderPageAtWidthShared(index, pxWidth) {
+        const key = index + '|' + Math.round(pxWidth / 100);
+        const existing = renderInFlight.get(key);
+        if (existing) return existing;
+        const work = renderPageAtWidth(index, pxWidth)
+            .finally(() => { renderInFlight.delete(key); });
+        renderInFlight.set(key, work);
+        return work;
+    }
+
+    /** Set the source of an image, downsampled to the display size when worthwhile. */
+    async function smartLoadImage(img, absolutePath, taskEpoch) {
         let targetWidth = 0;
+        let imageIndex;
         const idxStr = img.dataset.index;
         if (idxStr !== undefined && !isNaN(parseInt(idxStr, 10))) {
-            targetWidth = getExpectedTargetWidth(parseInt(idxStr, 10));
+            imageIndex = parseInt(idxStr, 10);
+            targetWidth = getExpectedTargetWidth(imageIndex);
         } else {
             const wrap = img.closest('.r-img > div');
             targetWidth = wrap ? (parseInt(wrap.style.width, 10) || wrap.offsetWidth) : 0;
         }
 
-        let url = 'file:///' + absolutePath.replace(/\\/g, '/');
-        let isAnimated = false;
+        let url = toFileURL(absolutePath);
+        // Read from container headers rather than a decode, and cached per page
+        // in archive-util. We need it here up front to skip the native decode()
+        // below, which on an animated WebP buffers every frame into the
+        // compositor and destroys the frame rate.
+        let isAnimated = imageIndex !== undefined
+            && archiveUtil.isPageAnimated(filePath, imageIndex);
 
-        // If sharp is available and we have a valid container width, scale it down
-        // We use JPEG for maximum encoding speed (vastly faster than PNG)
-        if (sharp && targetWidth > 0 && targetWidth < 3000) {
+        /**
+         * Pixel width of what actually ends up in the <img>. Recorded so a later
+         * resize can tell whether a re-render would gain anything: growing the
+         * window past this needs more pixels, everything else does not.
+         * Serving the untouched file means full native resolution, which no
+         * amount of window growth can improve on.
+         */
+        const nativeWidth = (imagesData[imageIndex] && imagesData[imageIndex].width) || 0;
+        let renderedWidth = nativeWidth || Infinity;
+
+        if (imageIndex !== undefined && !isAnimated && shouldDownsample(targetWidth, imageIndex)) {
+            // Target pixel width follows the device pixel ratio so text stays crisp
+            const pxWidth = Math.round(targetWidth * (window.devicePixelRatio || 1));
+
+            // Abort if the user navigated away before the resize starts
+            if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
+
             try {
-                // Determine target pixel width based on device pixel ratio for crispness
-                const pxWidth = Math.round(targetWidth * (window.devicePixelRatio || 1));
+                const res = await renderPageAtWidthShared(imageIndex, pxWidth);
 
-                // Abort if user scrolled away before sharp starts
+                // Abort if the user navigated away while the resize ran.
+                // This instantly unlocks the renderQueue for the new page.
                 if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
 
-                const ext = absolutePath.substring(absolutePath.lastIndexOf('.')).toLowerCase();
-                let sh = sharp(absolutePath);
-
-                // For webp, gif, and avif, actively check if the file contains animated frames
-                if (ext === '.webp' || ext === '.gif' || ext === '.avif') {
-                    const meta = await sh.metadata();
-                    if (meta && meta.pages > 1) {
-                        isAnimated = true;
-                    }
-                }
-
-                if (!isAnimated) {
-                    sh = sh.resize({ width: pxWidth, withoutEnlargement: true });
-
-                    // Preserve transparency formats where applicable
-                    if (ext === '.png') {
-                        sh = sh.png({ compressionLevel: 1 });
-                    } else if (ext === '.webp') {
-                        sh = sh.webp({ quality: 90, effort: 1 });
-                    } else {
-                        sh = sh.jpeg({ quality: 90 }); // Instant encode for static heavy lifts
-                    }
-
-                    const buffer = await sh.toBuffer();
-
-                    // Abort if user scrolled away while sharp was crunching in C++
-                    // This instantly unlocks the renderQueue for the new page!
+                if (res) {
+                    url = res.url;
+                    // `native` means renderAtScale handed back the original file
+                    // (animated, or already close enough to native to bother),
+                    // so what is on screen is full resolution.
+                    renderedWidth = res.native ? (nativeWidth || Infinity) : pxWidth;
+                } else {
+                    // Temp file purged out from under us — re-resolve
+                    const recovered = await archiveUtil.getImagePath(filePath, imageIndex);
                     if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
-
-                    const mime = ext === '.png' ? 'image/png' : (ext === '.webp' ? 'image/webp' : 'image/jpeg');
-                    const blob = new Blob([buffer], { type: mime });
-                    url = URL.createObjectURL(blob);
-                    newBlobUrl = url;
+                    if (recovered) url = toFileURL(recovered);
                 }
             } catch (err) {
-                // Self-Heal: if sharp failed because archive-util purged the file just before we read it
-                if (err && err.message && err.message.includes("missing")) {
-                    const imgIndexStr = img.dataset.index;
-                    if (imgIndexStr !== undefined) {
-                        try {
-                            const idx = parseInt(imgIndexStr, 10);
-                            const recoveredPath = await archiveUtil.getImagePath(filePath, idx);
-                            if (recoveredPath) {
-                                url = 'file:///' + recoveredPath.replace(/\\/g, '/');
-                                // Let it fall back to native loading below (or we could recurse)
-                            }
-                        } catch (e) { }
-                    }
-                } else {
-                    console.error("Sharp resize error:", err);
-                }
+                console.error('Downscale failed for page ' + imageIndex + ':', err);
+                try {
+                    const recovered = await archiveUtil.getImagePath(filePath, imageIndex);
+                    if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
+                    if (recovered) url = toFileURL(recovered);
+                } catch (_) { }
             }
         }
 
@@ -373,24 +626,23 @@
             if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
 
             img.src = url;
-            img.dataset.blobUrl = newBlobUrl;
+            // Now rendered at the current layout size, so no longer stale
+            img.dataset.stale = '';
+            img.dataset.renderedW = String(renderedWidth);
             if (isAnimated) {
                 img.dataset.animated = "1";
+                hasAnimatedImages = true;
                 // Trigger a layout flush so `setRImgSize` replaces exact pixels with responsive bounds
                 requestAnimationFrame(() => { disposeImages(); });
             }
 
-            // Clean up the old blob ONLY AFTER the new image is safely rendered on screen
-            if (oldBlob && oldBlob !== url) URL.revokeObjectURL(oldBlob);
-
-            if (currentScale > 1 && !disposeAfterLoadScheduled && !isAnimated) {
-                scheduleHiResRender(); // Snap to high-res instantly right after the chunk loads if user is presently zoomed
+            if (currentScale > 1 && !isAnimated) {
+                scheduleHiResRender(); // Snap to high-res right after the chunk loads if the user is zoomed
             }
         } catch (e) {
             if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
             img.src = url;
-            img.dataset.blobUrl = newBlobUrl;
-            if (oldBlob && oldBlob !== url) URL.revokeObjectURL(oldBlob);
+            img.dataset.stale = '';
         }
     }
 
@@ -400,9 +652,15 @@
             for (const e of entries) {
                 if (!e.isIntersecting) continue;
                 const wrap = e.target;
-                const img = wrap.tagName === 'IMG' ? wrap : wrap.querySelector('img');
-                if (!img || img.src) continue;
-                const idx = parseInt(img.dataset.index, 10);
+                // Support both <img> and <video> media elements
+                const vid = wrap.querySelector('video[data-is-video]');
+                const img = vid ? null : (wrap.tagName === 'IMG' ? wrap : wrap.querySelector('img'));
+                const mediaEl = vid || img;
+                if (!mediaEl) continue;
+                // Skip if already loaded
+                if (vid && vid.dataset.loaded) continue;
+                if (img && !needsLoad(img)) continue;
+                const idx = parseInt(mediaEl.dataset.index, 10);
                 if (isNaN(idx)) continue;
                 const dist = Math.abs(idx - getCurrentCenterImageIndex());
                 renderQueue.add(2000 - dist, idx, async (abortToken) => {
@@ -411,41 +669,46 @@
                     const currentDist = Math.abs(idx - getCurrentCenterImageIndex());
                     if (currentDist > 15) return;
 
-                    if (img.src) return;
+                    if (vid && vid.dataset.loaded) return;
+                    if (img && !needsLoad(img)) return;
 
                     try {
                         const fp = await archiveUtil.getImagePath(filePath, idx, abortToken);
                         if (!fp) return;
-                        if (img.dataset.index !== String(idx) || img.src) return;
-
                         if (taskEpoch !== renderEpoch) return;
 
                         const dims = archiveUtil.getImageDimensions(filePath, [idx]);
-                        if (dims && dims[0] && dims[0].width > 0) {
+                        // Skip dimension update for video entries — their real dims come from loadedmetadata
+                        if (!isVideoEntry(idx) && dims && dims[0] && dims[0].width > 0) {
                             imagesData[idx] = { width: dims[0].width, height: dims[0].height, aspectRatio: dims[0].width / dims[0].height };
                         }
 
-                        if (idx === 0) {
-                            img.addEventListener('load', function onFirstLoad() {
-                                img.removeEventListener('load', onFirstLoad);
-                                const w = img.closest('.r-img > div');
-                                if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
-                            });
-                        }
-                        await smartLoadImage(img, fp, taskEpoch);
-                        if (img.decode) {
-                            try { await img.decode(); } catch (_) { }
+                        if (vid) {
+                            await smartLoadVideo(vid, fp, taskEpoch);
+                        } else {
+                            if (img.dataset.index !== String(idx) || !needsLoad(img)) return;
+                            if (idx === 0) {
+                                img.addEventListener('load', function onFirstLoad() {
+                                    img.removeEventListener('load', onFirstLoad);
+                                    const w = img.closest('.r-img > div');
+                                    if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
+                                });
+                            }
+                            await smartLoadImage(img, fp, taskEpoch);
+                            if (img.decode) {
+                                try { await img.decode(); } catch (_) { }
+                            }
                         }
                         scheduleDisposeAfterLoad();
                     } catch (e) {
-                        console.error('Failed to load image ' + idx, e);
+                        console.error('Failed to load media ' + idx, e);
                     }
                 });
             }
         }, { root: readingContainer, rootMargin: '2000px', threshold: 0 });
-        readingTrack.querySelectorAll('.r-img img').forEach(el => {
-            const wrap = el.closest('.r-img > div');
-            if (wrap) imgObserver.observe(wrap);
+        // Observe both img and video wraps
+        readingTrack.querySelectorAll('.r-img > div').forEach(wrap => {
+            imgObserver.observe(wrap);
         });
     }
 
@@ -462,10 +725,9 @@
         const n = imageNames.length;
 
         const isDouble = pagesPerView === 2;
-        const rFlexAll = readingTrack.querySelectorAll('.r-flex');
 
         for (let i = 0; i < n; i++) {
-            const rFlex = rFlexAll[i];
+            const rFlex = rFlexEls[i];
             if (!rFlex) continue;
 
             const isCover = i === 0;
@@ -520,45 +782,84 @@
         const wrap = rImg.querySelector(':scope > div');
         if (!wrap) return;
 
-        const img = wrap.querySelector('img');
+        const vid = wrap.querySelector('video[data-is-video]');
+        const img = vid ? null : wrap.querySelector('img');
         const isAnimated = img && img.dataset.animated === '1';
+        const isFlexible = isAnimated; // Only animated WebP needs responsive sizing; videos use exact px like static images
 
-        if (isAnimated) {
-            // For animated WebP we set both an explicit pixel size AND maintain max-bounds:
-            // - Explicit `width/height` gives Chrome a concrete rasterization target so animation
-            //   frames are rendered at the actual display size (not at the full container 100% width).
-            // - We still omit `will-change: transform` / `translate3d` on the wrap itself (the CSS
-            //   `:has(img[data-animated="1"])` rule on .r-flex handles this) so the re-raster kick
-            //   can cleanly evict the compositor texture on zoom.
+        if (isFlexible) {
+            // For animated WebP: set both an explicit pixel size AND maintain max-bounds so
+            // Chrome has a concrete rasterization target for animation frames
             wrap.style.width = w + 'px';
             wrap.style.height = h + 'px';
             wrap.style.maxWidth = w + 'px';
             wrap.style.maxHeight = h + 'px';
             wrap.style.margin = '0 auto';
-            if (img) {
-                img.style.width = '100%';
-                img.style.height = 'auto'; // Maintain AR natively based on width
-                img.style.maxWidth = w + 'px';
-                img.style.maxHeight = h + 'px';
-            }
+            img.style.width = '100%';
+            img.style.height = 'auto';
+            img.style.maxWidth = w + 'px';
+            img.style.maxHeight = h + 'px';
         } else {
-            // For massive static manga pages, we rigidly lock the exact pixel bounds so that
-            // preloaded images entering the DOM do not cause catastrophic layout shifs
+            // Static images AND videos: lock to exact pixel bounds.
+            // For images, the AR was read from the file so w/h already match exactly.
+            // For videos, object-fit:contain (CSS) handles any AR mismatch without distortion.
             wrap.style.width = w + 'px';
             wrap.style.height = h + 'px';
             wrap.style.maxWidth = w + 'px';
             wrap.style.maxHeight = h + 'px';
             wrap.style.margin = '0';
-            if (img) {
+            if (vid) {
+                vid.style.width = w + 'px';
+                vid.style.height = h + 'px';
+                vid.style.maxWidth = w + 'px';
+                vid.style.maxHeight = h + 'px';
+                vid.style.display = 'block';
+            } else if (img) {
                 img.style.width = w + 'px';
                 img.style.height = h + 'px';
                 img.style.maxWidth = w + 'px';
                 img.style.maxHeight = h + 'px';
+                img.style.objectFit = 'fill';
             }
         }
     }
 
     // Layout mode (calculateView)
+    /**
+     * Remember where the reader is, as a page plus a fraction into that page.
+     *
+     * A whole-container fraction (scrollTop / scrollHeight) is not good enough
+     * here. Page heights in continuous mode are derived from the container
+     * width and each page's own aspect ratio, so a resize changes them by
+     * different amounts — most of all on webtoon strips, where one page can be
+     * many screens tall. Anchoring to a page and an offset within it survives
+     * that; a global fraction drifts.
+     *
+     * Offsets are in unscaled layout space, matching imagesFullPosition, so the
+     * anchor stays valid across a zoom change too.
+     *
+     * @returns {{index: number, frac: number}|null} null when not applicable
+     */
+    function captureScrollAnchor() {
+        if (!continuous || !posList.length) return null;
+        const y = readingContainer.scrollTop / (currentScale || 1);
+        const index = findIndexAtOffset(y);
+        const p = imagesFullPosition[index];
+        if (!p || !(p.height > 0)) return { index, frac: 0 };
+        // Clamped because y can land in the gap between pages, which belongs to
+        // no page and would otherwise give a fraction above 1.
+        const frac = Math.max(0, Math.min(1, (y - p.top) / p.height));
+        return { index, frac };
+    }
+
+    /** Put the reader back where captureScrollAnchor() found them. */
+    function restoreScrollAnchor(anchor) {
+        if (!anchor || !continuous) return;
+        const p = imagesFullPosition[anchor.index];
+        if (!p) return;
+        readingContainer.scrollTop = (p.top + anchor.frac * p.height) * (currentScale || 1);
+    }
+
     function calculateView(first) {
         const content = readingContainer;
         const rect = content.getBoundingClientRect();
@@ -586,6 +887,7 @@
 
             // Wipe dict to rebuild row heights
             imagesFullPosition = {};
+            posList = new Array(n);
 
             for (let i = 0; i < n; i++) {
                 const ar = getAspectRatio(i);
@@ -623,7 +925,13 @@
                 runY += rowHeight + gapPx;
             }
 
+            // Dense, index-ordered mirror of imagesFullPosition. `top` is
+            // non-decreasing, so lookups can binary search instead of scanning
+            // every page on each scroll event.
+            for (let i = 0; i < n; i++) posList[i] = imagesFullPosition[i] || null;
+
             unscaledTrackHeight = runY;
+            refreshZoomMetrics();
 
             if (!scrollLayerRaf) scrollLayerRaf = requestAnimationFrame(updateScrollLayerClass);
         } else {
@@ -631,7 +939,7 @@
             readingTrack.classList.add('slide-layout');
             readingTrack.style.flexDirection = '';
             readingTrack.style.direction = mangaRtl ? 'rtl' : '';
-            const n = readingTrack.querySelectorAll('.r-flex').length;
+            const n = rFlexEls.length;
             let totalW = pagesPerView === 2
                 ? (n <= 1 ? rect.width : rect.width * (1 + (n - 2) * 0.5 + (n % 2 === 1 ? 1 : 0.5)))
                 : rect.width * n;
@@ -640,13 +948,13 @@
             readingTrack.style.height = rect.height + 'px';
             readingTrack.style.flexDirection = '';
             updateSlideLayerClass();
+            refreshZoomMetrics();
         }
     }
 
     /** Add .slide-layer only to prev/current/next spreads to avoid layer explosion */
     function updateSlideLayerClass() {
         if (continuous || !readingTrack.classList.contains('slide-layout')) return;
-        readingTrack.querySelectorAll('.r-flex.scroll-layer').forEach(r => r.classList.remove('scroll-layer'));
         const indices = new Set();
         for (let s = -2; s <= 2; s++) {
             const spread0 = currentIndex - 1 + s;
@@ -654,10 +962,17 @@
             const spread = getSpreadAt(spread0);
             if (spread) spread.forEach(p => indices.add(p.index));
         }
-        readingTrack.querySelectorAll('.r-flex').forEach(r => {
-            const i = parseInt(r.dataset.index, 10);
-            r.classList.toggle('slide-layer', indices.has(i));
-        });
+        for (let i = 0, len = rFlexEls.length; i < len; i++) {
+            const r = rFlexEls[i];
+            if (!r) continue;
+            const shouldHave = indices.has(i);
+            // Only touch the class list when the state actually changes; blind
+            // toggles on every navigation invalidate style for the whole track.
+            if (r.classList.contains('slide-layer') !== shouldHave) {
+                r.classList.toggle('slide-layer', shouldHave);
+            }
+            if (r.classList.contains('scroll-layer')) r.classList.remove('scroll-layer');
+        }
     }
 
     /** Add .scroll-layer only to items near viewport to limit layers and fix vertical flicker */
@@ -675,28 +990,24 @@
         const viewTop = center - margin;
         const viewBot = center + margin;
 
-        // Use math-based positions to find visible range (no DOM reads)
-        let rangeStart = -1, rangeEnd = -1;
-        for (const key in imagesFullPosition) {
-            const pos = imagesFullPosition[key];
-            if (pos && pos.bottom >= viewTop && pos.top <= viewBot) {
-                const k = parseInt(key, 10);
-                if (rangeStart < 0 || k < rangeStart) rangeStart = k;
-                if (k > rangeEnd) rangeEnd = k;
-            }
-        }
+        // Use math-based positions to find the visible range (no DOM reads, no full scan)
+        let rangeStart = findIndexAtOffset(viewTop);
+        // Walk back over any rows that still overlap viewTop (two-up rows share a top)
+        while (rangeStart > 0 && posList[rangeStart - 1] && posList[rangeStart - 1].bottom >= viewTop) rangeStart--;
+        let rangeEnd = findIndexAtOffset(viewBot);
+        while (rangeEnd + 1 < posList.length && posList[rangeEnd + 1] && posList[rangeEnd + 1].top <= viewBot) rangeEnd++;
 
         // Only toggle classes on elements that changed state
-        const rFlexAll = readingTrack.querySelectorAll('.r-flex');
-        for (let i = 0, len = rFlexAll.length; i < len; i++) {
+        for (let i = 0, len = rFlexEls.length; i < len; i++) {
+            const el = rFlexEls[i];
+            if (!el) continue;
             const shouldHave = i >= rangeStart && i <= rangeEnd;
-            const has = rFlexAll[i].classList.contains('scroll-layer');
-            if (shouldHave !== has) {
-                rFlexAll[i].classList.toggle('scroll-layer', shouldHave);
+            if (el.classList.contains('scroll-layer') !== shouldHave) {
+                el.classList.toggle('scroll-layer', shouldHave);
             }
             // Also clear stale slide-layer
-            if (rFlexAll[i].classList.contains('slide-layer')) {
-                rFlexAll[i].classList.remove('slide-layer');
+            if (el.classList.contains('slide-layer')) {
+                el.classList.remove('slide-layer');
             }
         }
     }
@@ -714,14 +1025,14 @@
         const n = imageNames.length;
         if (pagesPerView === 2) {
             const sp = getSpreadPages(n, spreadIndex0);
-            const el0 = readingTrack.querySelectorAll('.r-flex')[sp.idx1];
-            const el1 = sp.idx2 != null ? readingTrack.querySelectorAll('.r-flex')[sp.idx2] : null;
+            const el0 = rFlexEls[sp.idx1];
+            const el1 = sp.idx2 != null ? rFlexEls[sp.idx2] : null;
             const r0 = el0 ? (el0.querySelector('.r-img') || el0).getBoundingClientRect() : { height: 0, top: 0 };
             const r1 = el1 ? (el1.querySelector('.r-img') || el1).getBoundingClientRect() : { height: 0, top: 0 };
             if (r0.height >= r1.height) return { height: r0.height, top: r0.top };
             return { height: r1.height, top: r1.top };
         }
-        const el = readingTrack.querySelectorAll('.r-flex')[spreadIndex0];
+        const el = rFlexEls[spreadIndex0];
         const rImg = el ? el.querySelector('.r-img') : null;
         const r = rImg ? rImg.getBoundingClientRect() : { height: 0, top: 0 };
         return { height: r.height, top: r.top };
@@ -815,19 +1126,22 @@
         const scrollTop = content.scrollTop / currentScale;
         const center = scrollTop + (rightSize.height / 2) / currentScale;
 
-        let selKey1 = 0;
+        // Binary search instead of scanning every page: positions are index-ordered
+        // and monotonic, and this runs on every scroll event.
+        let selKey1 = findIndexAtOffset(center);
         let closest = Infinity;
-        for (const key1 in imagesFullPosition) {
-            const pos = imagesFullPosition[key1];
-            if (!pos) continue;
-            if (pos.top <= center && pos.bottom >= center) {
-                selKey1 = parseInt(key1, 10);
-                break;
-            }
-            const d = Math.abs(pos.center - center);
-            if (d < closest) {
-                closest = d;
-                selKey1 = parseInt(key1, 10);
+        {
+            const hit = posList[selKey1];
+            if (hit && hit.top <= center && hit.bottom >= center) {
+                closest = 0;
+            } else {
+                // Not inside a row (we may be in a gap): pick the nearest neighbour
+                for (let k = Math.max(0, selKey1 - 2); k <= Math.min(posList.length - 1, selKey1 + 2); k++) {
+                    const pos = posList[k];
+                    if (!pos) continue;
+                    const d = Math.abs(pos.center - center);
+                    if (d < closest) { closest = d; selKey1 = k; }
+                }
             }
         }
 
@@ -853,6 +1167,7 @@
             currentIndex = newIndex;
             updatePageInfo();
             preloadImagesAroundCurrent();
+            syncVideoPlayback();
         }
         /* Keep preload pipeline full: run again after short delay so ahead images are requested early */
         clearTimeout(scrollPreloadTimer);
@@ -963,6 +1278,10 @@
         const dims = archiveUtil.getImageDimensions(filePath, resolvedIndices);
         if (dims && dims.length === resolvedIndices.length) {
             resolvedIndices.forEach((idx, i) => {
+                // Skip video entries — their real dims come from the loadedmetadata browser event.
+                // Writing the Node-side 16:9 placeholder here would overwrite the real AR
+                // and cause a snap-back 200-500ms after navigation when the preloader fires.
+                if (isVideoEntry(idx)) return;
                 const d = dims[i];
                 if (d && d.width > 0 && d.height > 0) {
                     imagesData[idx] = {
@@ -975,24 +1294,36 @@
         }
         const order = priority ? resolvedIndices : [...pathMap.keys()].sort((a, b) =>
             Math.abs(a - center) - Math.abs(b - center));
-        const imgsByIndex = {};
-        readingTrack.querySelectorAll('.r-img img').forEach(img => {
-            const idx = parseInt(img.dataset.index, 10);
-            if (!isNaN(idx) && !img.src) imgsByIndex[idx] = img;
-        });
-        for (const idx of order) {
-            const path = pathMap.get(idx);
-            const img = imgsByIndex[idx];
-            if (path && img && img.dataset.index === String(idx)) {
-                const dist = Math.abs(idx - center);
-                let taskPriority = priority ? (1000 - dist) : (100 - dist);
-                if (idx === center || (priority && idx > center && idx <= center + 2)) {
-                    taskPriority += 2000;
-                }
 
-                renderQueue.add(taskPriority, idx, async (abortToken) => {
-                    const taskEpoch = renderEpoch;
-                    if (img.src) return;
+        for (const idx of order) {
+            const mediaPath = pathMap.get(idx);
+            // Cached lookup – no full-track query per preload pass
+            const mediaEl = mediaEls[idx];
+            if (!mediaPath || !mediaEl) continue;
+            if (mediaEl.tagName === 'IMG') {
+                if (!needsLoad(mediaEl) || mediaEl.dataset.index !== String(idx)) continue;
+            } else if (mediaEl.dataset.loaded) {
+                continue;
+            }
+
+            const dist = Math.abs(idx - center);
+            let taskPriority = priority ? (1000 - dist) : (100 - dist);
+            if (idx === center || (priority && idx > center && idx <= center + 2)) {
+                taskPriority += 2000;
+            }
+
+            const isVid = mediaEl.tagName === 'VIDEO';
+
+            renderQueue.add(taskPriority, idx, async (abortToken) => {
+                const taskEpoch = renderEpoch;
+
+                if (isVid) {
+                    if (mediaEl.dataset.loaded) return;
+                    await smartLoadVideo(mediaEl, mediaPath, taskEpoch);
+                    scheduleDisposeAfterLoad();
+                } else {
+                    const img = mediaEl;
+                    if (!needsLoad(img)) return;
 
                     if (idx === 0) {
                         img.addEventListener('load', function clearThumbnailPlaceholder() {
@@ -1002,14 +1333,14 @@
                         });
                     }
 
-                    await smartLoadImage(img, path, taskEpoch);
+                    await smartLoadImage(img, mediaPath, taskEpoch);
 
                     if (img.decode) {
                         try { await img.decode(); } catch (_) { }
                     }
                     scheduleDisposeAfterLoad();
-                });
-            }
+                }
+            });
         }
     }
 
@@ -1110,6 +1441,7 @@
         updatePageInfo();
         updateNav();
         savePosition();
+        syncVideoPlayback();
 
         /* Debounce preloading: only fire 200ms after the last navigation event.
            During rapid key-holds this means work is queued only once the user stops. */
@@ -1118,15 +1450,93 @@
         }
     }
 
-    /** Hard reset of all loaded Native/Sharp image buffers to force re-evaluation of current layout footprint */
+    /**
+     * Does this image still need loading?
+     *
+     * An empty src means it was never loaded or was purged. A `stale` marker
+     * means it is loaded but at the wrong size for the current layout, so it
+     * should be re-rendered — while continuing to show its existing pixels until
+     * the replacement is decoded and ready to swap in.
+     */
+    function needsLoad(img) {
+        return !img.src || img.dataset.stale === '1';
+    }
+
+    /**
+     * Re-rendering only ever buys sharpness, never correctness — the layout is
+     * pure CSS and follows the window on its own. A page is worth redoing only
+     * when the box it has to fill has outgrown the pixels we rendered for it.
+     * Below this ratio the difference is invisible, and re-rendering every page
+     * for a one-pixel drag is pure waste.
+     */
+    const RERENDER_GROWTH_THRESHOLD = 1.05;
+
+    /**
+     * Mark pages whose current render is now too low-resolution for the space
+     * they occupy, without clearing what is on screen.
+     *
+     * purgeRenderCache() empties every src, which is right for a layout-mode
+     * switch — the whole track is being rebuilt — but wrong for a window resize.
+     * Blanking a page that is being looked at leaves a visible hole for as long
+     * as the re-decode takes, and every load path is guarded on `src` being
+     * empty, so clearing it is otherwise the only way to make a page reload.
+     * Marking instead lets smartLoadImage do its usual decode-then-swap, which
+     * never shows an empty frame.
+     *
+     * Shrinking the window marks nothing: a render made for a bigger box still
+     * has more pixels than the smaller one needs, and the GPU downscales it for
+     * free. Pages already served at native resolution are never marked either,
+     * since no re-render can add detail that is not in the file.
+     *
+     * Videos are deliberately untouched: object-fit rescales them for free, and
+     * reloading one would restart playback on every resize event.
+     *
+     * @returns {number} how many pages were marked
+     */
+    function invalidateRenderedSizes() {
+        const dpr = window.devicePixelRatio || 1;
+        let marked = 0;
+
+        for (let i = 0, len = mediaEls.length; i < len; i++) {
+            const el = mediaEls[i];
+            if (!el || el.tagName !== 'IMG' || !el.src) continue;
+
+            const rendered = parseFloat(el.dataset.renderedW);
+            // Unknown provenance (e.g. loaded before this bookkeeping existed):
+            // re-render rather than risk leaving it blurry.
+            if (!isNaN(rendered) && rendered > 0) {
+                const required = getExpectedTargetWidth(i) * dpr;
+                if (required <= rendered * RERENDER_GROWTH_THRESHOLD) continue;
+            }
+            el.dataset.stale = '1';
+            marked++;
+        }
+
+        // Only disturb in-flight work if there is actually something to redo
+        if (marked > 0) {
+            renderQueue.clear();
+            renderEpoch++;
+        }
+        return marked;
+    }
+
+    /** Drop every loaded media source so the new layout footprint is re-evaluated */
     function purgeRenderCache() {
-        readingTrack.querySelectorAll('.r-img img').forEach(img => {
-            img.src = '';
-            img.removeAttribute('src');
-            if (img.dataset.blobUrl) URL.revokeObjectURL(img.dataset.blobUrl);
-            img.dataset.blobUrl = '';
-            img.dataset.hiRes = '';
-        });
+        for (let i = 0, len = mediaEls.length; i < len; i++) {
+            const el = mediaEls[i];
+            if (!el) continue;
+            if (el.tagName === 'VIDEO') {
+                el.pause();
+                el.removeAttribute('src'); // removeAttribute avoids empty-string resolving to page URL
+                el.load();
+                delete el.dataset.loaded; // Remove entirely so the guard check works cleanly
+            } else {
+                el.src = '';
+                el.removeAttribute('src');
+                el.dataset.hiRes = '';
+                el.dataset.stale = ''; // empty src already means "needs loading"
+            }
+        }
         renderQueue.clear();
         renderEpoch++;
     }
@@ -1136,8 +1546,15 @@
         syncViewMode();
         setSetting('pagesPerView', pagesPerView);
         setSetting('continuous', continuous ? 'true' : 'false');
-        modeSingle.classList.toggle('active', pagesPerView === 1);
-        modeDouble.classList.toggle('active', pagesPerView === 2);
+        // Single button, icon carries the state (same pattern as the LTR/RTL toggle)
+        const isDoubleView = pagesPerView === 2;
+        if (pagesSingleIcon) pagesSingleIcon.classList.toggle('hide', isDoubleView);
+        if (pagesDoubleIcon) pagesDoubleIcon.classList.toggle('hide', !isDoubleView);
+        if (pagesToggle) {
+            pagesToggle.title = isDoubleView
+                ? 'Double page – click for single page'
+                : 'Single page – click for double page';
+        }
         if (continuousToggle) continuousToggle.classList.toggle('active', continuous);
         toolbar.classList.remove('scroll-mode', 'single-mode', 'double-mode');
         toolbar.classList.add(continuous ? 'scroll-mode' : (pagesPerView === 1 ? 'single-mode' : 'double-mode'));
@@ -1284,6 +1701,98 @@
     const MAX_SCALE = 8;
     let zoomTx = 0, zoomTy = 0;
 
+    /**
+     * Cached layout measurements for the zoom path.
+     *
+     * applyScale() and dragZoom() run on every mousemove of a zoom or pan drag.
+     * Reading getBoundingClientRect() and especially readingTrack.scrollWidth
+     * there forces a synchronous layout of the whole track on each event, which
+     * is what made rapid zoom drags stutter. These are refreshed whenever the
+     * layout actually changes instead.
+     */
+    let cachedTrackScrollWidth = 0;
+    /** Any animated image currently in the track? Avoids a per-event DOM query. */
+    let hasAnimatedImages = false;
+
+    function refreshZoomMetrics() {
+        cachedTrackScrollWidth = readingTrack.scrollWidth;
+    }
+
+    /**
+     * Viewport box, without forcing a layout when the size is already known.
+     * calculateView() records it in rightSize on every layout change, so the
+     * per-mousemove zoom path can read that instead of calling
+     * getBoundingClientRect() on every event.
+     */
+    function viewportRect() {
+        if (rightSize.width > 0 && rightSize.height > 0) {
+            return { width: rightSize.width, height: rightSize.height };
+        }
+        const r = readingContainer.getBoundingClientRect();
+        return { width: r.width, height: r.height };
+    }
+
+    /**
+     * Opt-in zoom profiler.
+     *
+     * Run `cbzProfileZoom()` in the console, do one zoom drag, and it reports
+     * where the time actually went: how long applyScale took per event, how many
+     * frames were dropped, and any long task the browser recorded. Guessing at
+     * compositor behaviour from symptoms is unreliable — this measures it.
+     */
+    let profiling = null;
+    window.cbzProfileZoom = function (seconds) {
+        const dur = (seconds || 8) * 1000;
+        profiling = { applyScale: [], frames: [], longTasks: [], started: performance.now() };
+
+        let lastFrame = performance.now();
+        const onFrame = () => {
+            if (!profiling) return; // run ended between frames
+            const now = performance.now();
+            profiling.frames.push(now - lastFrame);
+            lastFrame = now;
+            requestAnimationFrame(onFrame);
+        };
+        requestAnimationFrame(onFrame);
+
+        let observer = null;
+        try {
+            observer = new PerformanceObserver(list => {
+                for (const entry of list.getEntries()) profiling.longTasks.push(Math.round(entry.duration));
+            });
+            observer.observe({ entryTypes: ['longtask'] });
+        } catch (_) { }
+
+        console.log('[cbz-reader] profiling zoom for ' + (dur / 1000) + 's — do a zoom drag now');
+        setTimeout(() => {
+            const p = profiling;
+            profiling = null;
+            if (observer) try { observer.disconnect(); } catch (_) { }
+
+            const stat = arr => {
+                if (!arr.length) return 'none';
+                const s = [...arr].sort((a, b) => a - b);
+                const sum = s.reduce((a, b) => a + b, 0);
+                return 'n=' + s.length +
+                    ' avg=' + (sum / s.length).toFixed(1) + 'ms' +
+                    ' p50=' + s[Math.floor(s.length * 0.5)].toFixed(1) +
+                    ' p95=' + s[Math.floor(s.length * 0.95)].toFixed(1) +
+                    ' max=' + s[s.length - 1].toFixed(1);
+            };
+            const dropped = p.frames.filter(f => f > 25).length;
+            console.log('[cbz-reader] ── zoom profile ──');
+            console.log('  applyScale : ' + stat(p.applyScale));
+            console.log('  frame gaps : ' + stat(p.frames) +
+                '   (' + dropped + ' of ' + p.frames.length + ' over 25ms)');
+            console.log('  long tasks : ' + (p.longTasks.length
+                ? p.longTasks.length + ' — ' + p.longTasks.join(', ') + ' ms'
+                : 'none recorded'));
+            console.log('  scale now  : ' + currentScale.toFixed(2) +
+                '   page ' + currentIndex + '/' + indexNum +
+                '   mode ' + (continuous ? 'scroll' : pagesPerView + '-page'));
+        }, dur);
+    };
+
     // Helper: get unscaled track height from math-based positions (no DOM read)
     function getUnscaledTrackHeight() {
         const n = imageNames.length;
@@ -1296,6 +1805,15 @@
     }
 
     function applyScale(scale, animation, focalX, focalY) {
+        const _t0 = profiling ? performance.now() : 0;
+        try {
+            applyScaleInner(scale, animation, focalX, focalY);
+        } finally {
+            if (profiling) profiling.applyScale.push(performance.now() - _t0);
+        }
+    }
+
+    function applyScaleInner(scale, animation, focalX, focalY) {
         const prevScale = currentScale;
         currentScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
         haveZoom = currentScale !== 1;
@@ -1312,7 +1830,7 @@
             zoomResetBtn.title = `Zoom: ${label} (Click to reset)`;
         }
 
-        const rect = readingContainer.getBoundingClientRect();
+        const rect = viewportRect();
         const fX = focalX !== undefined ? focalX : rect.width / 2;
         const fY = focalY !== undefined ? focalY : rect.height / 2;
 
@@ -1355,7 +1873,7 @@
             // Content-aware clamp: maxTx = half of the overflow beyond viewport width.
             // When image fits (scaledW <= viewportW) → maxTx = 0 → zoomTx forced to 0, no snap.
             // When image overflows → pan is allowed up to the image edge.
-            const scaledW = readingTrack.scrollWidth * currentScale;
+            const scaledW = cachedTrackScrollWidth * currentScale;
             const rawMaxTx = (scaledW - rect.width) / 2;
             const maxTx = Math.max(0, rawMaxTx);
             zoomTx = Math.max(-maxTx, Math.min(maxTx, zoomTx));
@@ -1384,7 +1902,6 @@
             readingContainer.scrollTop = newAbsY - fY;
         } else {
             // Paged mode scales outwards from the very center of the viewport
-            const rect = readingContainer.getBoundingClientRect();
 
             // Unscaled distance from center to finger/mouse
             const cx = rect.width / 2;
@@ -1436,8 +1953,7 @@
         // Only run when scale actually changes (not on pan-only calls) and not during a navigation
         // slide animation (where readingTrack needs its compositor layer for smooth 60fps scrolling).
         if (prevScale !== currentScale) {
-            const hasAnimated = readingTrack.querySelector('img[data-animated="1"]') !== null;
-            if (hasAnimated && !slideAnimationRaf) {
+            if (hasAnimatedImages && !slideAnimationRaf) {
                 readingTrack.style.willChange = 'auto'; // Override CSS will-change: transform → de-freeze layer
                 readingBody.style.willChange = 'auto';  // Also clear readingBody in case it was promoted too
                 void readingTrack.offsetHeight;         // Synchronous layout flush → forces repaint at new scale
@@ -1455,135 +1971,185 @@
         }
 
         contentEl.classList.toggle('zoomed', haveZoom);
-        scheduleHiResRender();
+        if (!rightDrag && !zoomMoveData.active) {
+            scheduleHiResRender();
+        }
     }
 
-    /** After zoom settles, re-render visible images at higher resolution via Sharp */
+    /** After zoom settles, re-render the visible pages at higher resolution */
     let hiResTimer = 0;
-    function scheduleHiResRender() {
+    /** Bumped when zoom changes or a new hi-res pass starts — stale swaps bail out. */
+    let hiResGeneration = 0;
+    const HI_RES_DEBOUNCE_MS = 80;
+
+    /**
+     * De-promote readingTrack/readingBody from their compositor layer just long
+     * enough for a hi-res swap to repaint at the current effective resolution,
+     * then re-promote.
+     *
+     * Coalesced across the whole hi-res pass rather than toggled per-image: in
+     * double-page mode the two pages finish their resize at different times
+     * (decode cost depends on each page's own size/complexity), and toggling
+     * these shared ancestors independently for each one means page A's swap
+     * forces a second, later repaint of page B too — a page that was already
+     * sharp and didn't need one. That second, out-of-sync repaint is what turns
+     * a single settle into two, which is what a jiggle looks like. Reusing one
+     * detach/reattach window for every swap that lands within a couple of
+     * frames of each other keeps it to one repaint per pass.
+     */
+    let trackDetachedForHiRes = false;
+    let trackReattachRaf1 = 0;
+    let trackReattachRaf2 = 0;
+    function detachTrackForHiResSwap() {
+        if (!trackDetachedForHiRes) {
+            trackDetachedForHiRes = true;
+            readingTrack.style.willChange = 'auto';
+            readingBody.style.willChange = 'auto';
+        }
+        cancelAnimationFrame(trackReattachRaf1);
+        cancelAnimationFrame(trackReattachRaf2);
+        trackReattachRaf1 = requestAnimationFrame(() => {
+            trackReattachRaf2 = requestAnimationFrame(() => {
+                trackDetachedForHiRes = false;
+                readingTrack.style.willChange = '';
+                readingBody.style.willChange = '';
+            });
+        });
+    }
+
+    /**
+     * Promote a decoded hi-res frame into the visible <img> without a synchronous
+     * layout flush. offsetHeight during swap was a major source of drag stutter
+     * and occasional post-zoom nudges when the track was re-measured mid-gesture.
+     */
+    function commitHiResImage(img, url) {
+        const wrap = img.closest('.r-img > div');
+        if (wrap) {
+            const w = wrap.style.width;
+            const h = wrap.style.height;
+            if (w) img.style.width = w;
+            if (h) img.style.height = h;
+            img.style.objectFit = 'fill';
+        }
+
+        const rFlex = img.closest('.r-flex');
+        if (rFlex) rFlex.style.willChange = 'auto';
+        detachTrackForHiResSwap();
+
+        img.src = url;
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                if (rFlex) rFlex.style.willChange = '';
+            });
+        });
+    }
+
+    function scheduleHiResRender(immediate) {
         clearTimeout(hiResTimer);
         if (currentScale <= 1) {
             revertHiRes();
             return;
         }
+        // Heavy decode/resize during an active drag competes with compositor zoom
+        // and replays the debounce on every mousemove pause — defer until release.
+        if (!immediate && (rightDrag || zoomMoveData.active)) {
+            return;
+        }
+
+        const gen = ++hiResGeneration;
+        const delay = immediate ? 0 : HI_RES_DEBOUNCE_MS;
         hiResTimer = setTimeout(() => {
-            const spread = getSpreadAt(currentIndex - 1);
-            if (!spread) return;
-
-            spread.forEach(p => {
-                const idx = p.index;
-                const img = readingTrack.querySelector(`.r-img-i${idx} img`);
-                if (!img || img.dataset.animated === '1') return;
-                const d = imagesData[idx];
-                if (!d || !d.width) return;
-
-                const wrap = img.closest('.r-img > div');
-                const explicitW = wrap ? parseInt(wrap.style.width, 10) : 0;
-                const displayW = explicitW > 0 ? explicitW : (wrap ? wrap.getBoundingClientRect().width / currentScale : 0);
-                if (displayW <= 0) return;
-
-                const dpr = window.devicePixelRatio || 1;
-                const targetScale = Math.min(currentScale * dpr, d.width / displayW);
-                if (targetScale <= dpr * 1.1) return;
-                const targetPixelWidth = Math.round(displayW * targetScale);
-
-                archiveUtil.renderAtScale(filePath, idx, targetPixelWidth).then(async fp => {
-                    if (!fp || currentScale <= 1) return;
-
-                    try {
-                        const preload = new Image();
-                        preload.src = 'file:///' + fp.replace(/\\/g, '/');
-                        await preload.decode(); // Wait until decoded in memory (0-frame flicker swap)
-
-                        if (img.dataset.index === String(idx) && currentScale > 1) {
-                            if (img.dataset.blobUrl) URL.revokeObjectURL(img.dataset.blobUrl);
-                            img.dataset.blobUrl = '';
-                            img.dataset.hiRes = '1';
-
-                            // Evict the frozen compositor texture BEFORE setting the high-res src,
-                            // otherwise Chromium paints the crispy image into the 1x GPU texture memory.
-                            readingTrack.style.willChange = 'auto';
-                            readingBody.style.willChange = 'auto';
-                            const rFlex = img.closest('.r-flex');
-                            if (rFlex) rFlex.style.willChange = 'auto';
-
-                            img.src = preload.src;
-
-                            void readingTrack.offsetHeight; // Synchronous layout flush forces native repaint
-
-                            requestAnimationFrame(() => {
-                                requestAnimationFrame(() => {
-                                    readingTrack.style.willChange = '';
-                                    readingBody.style.willChange = '';
-                                    if (rFlex) rFlex.style.willChange = '';
-                                });
-                            });
-                        }
-                    } catch (err) {
-                        // Ignore decode errors
-                    }
-                }).catch(() => { });
-            });
-        }, 50); // fast snap
+            if (rightDrag || zoomMoveData.active) return;
+            runHiResRender(gen);
+        }, delay);
     }
 
-    function revertHiRes() {
-        readingTrack.querySelectorAll('img[data-hi-res="1"]').forEach(img => {
-            const idx = parseInt(img.dataset.index, 10);
-            if (isNaN(idx)) return;
-            img.dataset.hiRes = '';
+    function runHiResRender(gen) {
+        const spread = getSpreadAt(currentIndex - 1);
+        if (!spread) return;
 
-            archiveUtil.getImagePath(filePath, idx).then(async fp => {
-                if (fp && img.dataset.index === String(idx)) {
-                    // Revert to original seamlessly
-                    try {
-                        const newSrc = 'file:///' + fp.replace(/\\/g, '/');
-                        const preload = new Image();
-                        preload.src = newSrc;
-                        await preload.decode();
-                        if (img.dataset.index === String(idx) && currentScale <= 1) {
-                            smartLoadImage(img, fp);
-                        }
-                    } catch (e) {
-                        smartLoadImage(img, fp);
+        const scaleAtRun = currentScale;
+
+        spread.forEach(p => {
+            const idx = p.index;
+            const img = mediaEls[idx];
+            if (!img || img.tagName !== 'IMG' || img.dataset.animated === '1') return;
+
+            const wrap = img.closest('.r-img > div');
+            const explicitW = wrap ? parseInt(wrap.style.width, 10) : 0;
+            const displayW = explicitW > 0 ? explicitW : (wrap ? wrap.getBoundingClientRect().width / currentScale : 0);
+            if (displayW <= 0) return;
+
+            const dpr = window.devicePixelRatio || 1;
+            const d = imagesData[idx];
+            const nativeCap = (d && d.width > 0) ? d.width / displayW : Infinity;
+            const targetScale = Math.min(scaleAtRun * dpr, nativeCap);
+            if (targetScale <= dpr * 1.1) return;
+
+            // Sharp resizes natively (no browser canvas/WebCodecs memory ceiling to
+            // clamp for), so the target pixel width is used as computed.
+            const targetPixelWidth = Math.round(displayW * targetScale);
+
+            const startedAt = performance.now();
+            renderPageAtWidthShared(idx, targetPixelWidth)
+                .then(async res => {
+                    if (gen !== hiResGeneration || currentScale <= 1) return;
+                    if (Math.abs(currentScale - scaleAtRun) > 0.15) return;
+                    if (!res) return;
+
+                    if (img.src === res.url) {
+                        img.dataset.hiRes = '1';
+                        return;
                     }
-                }
-            }).catch(() => { });
+
+                    let preloadWidth = 0, preloadHeight = 0;
+                    try {
+                        const preload = new Image();
+                        preload.src = res.url;
+                        await preload.decode();
+                        preloadWidth = preload.naturalWidth;
+                        preloadHeight = preload.naturalHeight;
+
+                        if (gen !== hiResGeneration) return;
+                        if (img.dataset.index !== String(idx) || currentScale <= 1) return;
+
+                        img.dataset.hiRes = '1';
+                        commitHiResImage(img, preload.src);
+                    } catch (err) {
+                        console.warn('[cbz-reader] hi-res decode failed for page ' + idx + ':', err);
+                    }
+
+                    console.debug('[cbz-reader] hi-res page ' + idx + ': asked ' +
+                        targetPixelWidth + 'px, got ' + (res.native ? 'original file' : 'scaled copy') +
+                        ' ' + preloadWidth + 'x' + preloadHeight +
+                        ' in ' + Math.round(performance.now() - startedAt) + 'ms');
+                })
+                .catch(err => {
+                    console.warn('[cbz-reader] hi-res render failed for page ' + idx + ':', err);
+                });
         });
     }
 
-    // Helper to get the on-screen focal point of the current image
-    function getFocalPoint() {
-        const rect = readingContainer.getBoundingClientRect();
-        const fX = rect.width / 2;
-        let fY = rect.height / 2;
+    function revertHiRes() {
+        for (let idx = 0, len = mediaEls.length; idx < len; idx++) {
+            const img = mediaEls[idx];
+            if (!img || img.tagName !== 'IMG' || img.dataset.hiRes !== '1') continue;
+            img.dataset.hiRes = '';
 
-        if (continuous && imagesFullPosition[currentIndex - 1]) {
-            // Find where the center of the current image actually is on screen
-            const pos = imagesFullPosition[currentIndex - 1];
-            const imgCenterY = pos.center; // Already naturally scaled by calculateView
-            // Subtract scroll to get screen-relative Y coordinate
-            const screenY = imgCenterY - readingContainer.scrollTop;
-
-            // If the image center is completely off-screen, fall back to screen center
-            if (screenY >= 0 && screenY <= rect.height) {
-                fY = screenY;
-            }
+            archiveUtil.getImagePath(filePath, idx).then(fp => {
+                // Re-render at display size; the result is disk-cached, so this is
+                // usually just a file read rather than another resize.
+                if (fp && img.dataset.index === String(idx) && currentScale <= 1) {
+                    smartLoadImage(img, fp);
+                }
+            }).catch(() => { });
         }
-        return { fX, fY };
     }
 
-    function zoomIn(fX, fY) {
-        const targetScale = currentScale * 1.25;
-        if (fX === undefined) { const fp = getFocalPoint(); fX = fp.fX; fY = fp.fY; }
-        applyScale(targetScale, !continuous, fX, fY);
-    }
-
-    function zoomOut(fX, fY) {
-        const targetScale = currentScale / 1.25;
-        if (fX === undefined) { const fp = getFocalPoint(); fX = fp.fX; fY = fp.fY; }
-        applyScale(targetScale, !continuous, fX, fY);
-    }
+    /* Stepped zoom buttons were removed from the toolbar — right-click drag is the
+       zoom gesture, matching Eagle's own image viewer. applyScale() remains the
+       entry point if a keyboard or button zoom is ever wanted again. */
 
     function resetZoom() {
         currentScale = 1;
@@ -1605,12 +2171,12 @@
 
     function dragZoom(dx, dy) {
         zoomTx = scalePrevData.tranX2 + dx;
-        const rect = readingContainer.getBoundingClientRect();
+        const rect = viewportRect();
 
         if (continuous) {
             // Same content-aware clamping as applyScale: lock to center when image fits,
             // allow panning up to the image edge when it overflows the viewport.
-            const scaledW = readingTrack.scrollWidth * currentScale;
+            const scaledW = cachedTrackScrollWidth * currentScale;
             const maxTx = Math.max(0, (scaledW - rect.width) / 2);
             zoomTx = Math.max(-maxTx, Math.min(maxTx, zoomTx));
         } else {
@@ -1671,8 +2237,7 @@
 
     btnPrev.addEventListener('click', () => go(-1));
     btnNext.addEventListener('click', () => go(1));
-    modeSingle.addEventListener('click', () => setPagesPerView(1));
-    modeDouble.addEventListener('click', () => setPagesPerView(2));
+    if (pagesToggle) pagesToggle.addEventListener('click', () => setPagesPerView(pagesPerView === 2 ? 1 : 2));
     if (continuousToggle) continuousToggle.addEventListener('click', () => setContinuous(!continuous));
     if (scrollGapToggle) scrollGapToggle.addEventListener('click', () => setScrollGap(!scrollGap));
     if (mangaRtlBtn) mangaRtlBtn.addEventListener('click', () => setMangaRtl(!mangaRtl));
@@ -1696,7 +2261,14 @@
             if (e.button === 2) {
                 // Right-click drag → zoom
                 e.preventDefault();
-                rightDrag = { startX: e.clientX, startY: e.clientY, startScale: currentScale };
+                clearTimeout(hiResTimer);
+                hiResGeneration++;
+                // Measure the container once, here, so the mousemove handler never has to
+                const box = readingContainer.getBoundingClientRect();
+                rightDrag = {
+                    startX: e.clientX, startY: e.clientY, startScale: currentScale,
+                    focalX: e.clientX - box.left, focalY: e.clientY - box.top,
+                };
                 contentEl.classList.add('dragging');
             } else if (e.button === 0) {
                 // Left-click drag → navigate (or pan when zoomed)
@@ -1741,12 +2313,10 @@
                 const dy = rightDrag.startY - e.clientY;
                 const newScale = rightDrag.startScale * Math.pow(1.005, dy);
 
-                const rect = readingContainer.getBoundingClientRect();
-                const fX = rightDrag.startX - rect.left;
-                const fY = rightDrag.startY - rect.top;
-
-                // Update CSS scale without triggering native recalculations
-                applyScale(newScale, false, fX, fY);
+                // The focal point is fixed for the whole gesture, so its offset was
+                // measured once on mousedown — re-reading the container box on every
+                // mousemove would force a layout mid-drag.
+                applyScale(newScale, false, rightDrag.focalX, rightDrag.focalY);
             } else if (zoomMoveData.active) {
                 // Left-drag pan (zoomed)
                 e.preventDefault();
@@ -1806,6 +2376,7 @@
                 rightDrag = null;
                 contentEl.classList.remove('dragging');
                 if (Math.abs(currentScale - 1) < 0.05) resetZoom();
+                else scheduleHiResRender(true);
             } else if (zoomMoveData.active) {
                 if (continuous) {
                     const hist = zoomMoveData.velocityHistory;
@@ -1821,6 +2392,7 @@
                 }
                 dragZoomEnd();
                 contentEl.classList.remove('dragging');
+                scheduleHiResRender(true);
             } else if (dragNav) {
                 const wasDrag = dragNav.moved;
                 contentEl.classList.remove('dragging');
@@ -1866,6 +2438,7 @@
                 rightDrag = null;
                 contentEl.classList.remove('dragging');
                 if (Math.abs(currentScale - 1) < 0.05) resetZoom();
+                else scheduleHiResRender(true);
             }
             if (zoomMoveData.active) {
                 dragZoomEnd();
@@ -1883,8 +2456,6 @@
         window.addEventListener('blur', cancelAllDrags);
     }
 
-    if (zoomInBtn) zoomInBtn.addEventListener('click', () => zoomIn());
-    if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => zoomOut());
     if (zoomResetBtn) zoomResetBtn.addEventListener('click', () => resetZoom());
 
     document.addEventListener('keydown', e => {
@@ -1898,18 +2469,65 @@
         }
     });
 
+    /**
+     * Re-render at the new window size, once the user stops dragging.
+     *
+     * Split from the layout work below on purpose. A drag-resize fires `resize`
+     * continuously, and re-rasterising every page on every one of those events
+     * is both wasteful and self-defeating — each pass cancels the last via
+     * renderEpoch, so a slow drag could leave nothing finished. Layout stays
+     * immediate so the page keeps tracking the window; only the expensive
+     * re-render waits for things to settle.
+     */
+    let resizeRenderTimer = 0;
+    const RESIZE_SETTLE_MS = 180;
+
     window.addEventListener('resize', () => {
         if (!readingTrack.children.length) return;
-        if (haveZoom) resetZoom();
+
+        // Where the reader is, captured before the layout moves under them
+        const anchor = captureScrollAnchor();
+
+        // Immediate: keep the layout correct while the window is being dragged.
+        // Existing pixels are simply scaled by CSS in the meantime.
         disposeImages();
         calculateView(false);
-        // Both paged and continuous need to snap back to the active page after layout changes
-        goToIndex(currentIndex, false);
+
+        if (anchor) {
+            // Continuous: hold the exact reading position. goToIndex would jump
+            // to the top of the current page, which on a tall webtoon strip can
+            // throw away several screens of progress for a one-pixel drag.
+            restoreScrollAnchor(anchor);
+        } else {
+            // Paged: reposition the horizontal track on the active spread
+            goToIndex(currentIndex, false);
+        }
+
+        // Zoom survives a resize. The pan offset is in layout pixels, so a new
+        // viewport can put it out of range; re-applying the same scale runs the
+        // clamp in applyScale against the new bounds and re-commits the
+        // transform. Dropping to 1x instead — which is what this used to do —
+        // threw away the reader's position for a one-pixel drag.
+        if (haveZoom) applyScale(currentScale, false);
+
+        // Deferred: re-render anything the resize left under-resolved.
+        //
+        // The preload call is the fix for pages vanishing on resize. Marking
+        // alone is not enough: the IntersectionObserver only reacts to
+        // intersection *changes*, and a page that was visible before the resize
+        // is still visible after it, so nothing would ever ask for it again.
+        clearTimeout(resizeRenderTimer);
+        resizeRenderTimer = setTimeout(() => {
+            if (!readingTrack.children.length) return;
+            if (invalidateRenderedSizes() === 0) return; // nothing gained by redoing anything
+            preloadImagesAroundCurrent();
+        }, RESIZE_SETTLE_MS);
     });
 
     window.addEventListener('beforeunload', () => {
         savePositionImmediate();
-        archiveUtil.cleanup(filePath);
+        // Pass the token so we only tear down the session we actually opened
+        archiveUtil.cleanup(filePath, sessionToken);
     });
 
     // ── Per-image context menu ──────────────────────────────────────────
@@ -1971,39 +2589,68 @@
         if (!isCBZ) return;
         const entryName = imageNames[idx];
         if (!entryName) return;
+
+        if (imageNames.length <= 1) {
+            eagle.notification.show({
+                duration: 3000,
+                title: 'Remove Failed',
+                body: 'Cannot remove the only page in the archive',
+            });
+            return;
+        }
+
+        const label = getPageLabel(idx);
         try {
             const result = await eagle.dialog.showMessageBox({
                 type: 'warning',
                 title: 'Remove from Archive',
-                message: `Remove "${getPageLabel(idx)}" from archive?\n\nThis cannot be undone.`,
+                message: `Remove "${label}" from archive?\n\nThis cannot be undone.`,
                 buttons: ['Cancel', 'Remove'],
             });
             if (result.response !== 1) return;
 
+            // Stop all in-flight rendering before the archive is rewritten. Pending
+            // tasks reference the old page indices and the old temp files, and on
+            // Windows an open read handle blocks the archive replacement entirely.
+            renderQueue.clear();
+            renderEpoch++;
+            purgeRenderCache();
+
             await archiveUtil.removeEntryCBZ(filePath, entryName);
 
-            // Reload viewer with updated archive
+            // Everything below is keyed by page index, and indices just shifted.
+            imagesData = {};
+            imagesFullPosition = {};
+            rightSize = { width: 0, height: 0, scrollHeight: 0 };
+
             const savedIndex = currentIndex;
             imageNames = await archiveUtil.listImages(filePath);
+            sessionToken = await archiveUtil.getSessionToken(filePath);
+
             if (imageNames.length === 0) {
-                readingTrack.innerHTML = '<div style="padding:20px;text-align:center;color:var(--color-text-secondary)">Archive is empty</div>';
+                readingTrack.innerHTML = '<div style="padding:20px;text-align:center;color:var(--color-text-tertiary)">Archive is empty</div>';
+                indexNum = 0;
+                updatePageInfo();
                 return;
             }
-            updateIndexNum();
-            readingTrack.innerHTML = '';
-            addHtmlImages();
-            currentIndex = Math.min(savedIndex, indexNum);
-            disposeImages();
-            calculateView(true);
-            goToIndex(currentIndex, false);
-            updatePageInfo();
-            updateNav();
-            preloadImagesAroundCurrent();
 
-            eagle.notification.show({ duration: 3000, title: 'Image Removed', body: getPageLabel(Math.min(idx, imageNames.length - 1)) });
+            // Rebuild through applyView so layout classes, gap state and the
+            // slide/scroll track are all reconstructed consistently.
+            readingTrack.innerHTML = '';
+            readingTrack.className = '';
+            updateIndexNum();
+            currentIndex = Math.max(1, Math.min(savedIndex, indexNum));
+            addHtmlImages();
+            applyView();
+
+            eagle.notification.show({ duration: 3000, title: 'Image Removed', body: label });
         } catch (err) {
             console.error('Remove failed:', err);
-            eagle.notification.show({ duration: 3000, title: 'Remove Failed', body: err.message });
+            eagle.notification.show({
+                duration: 3000,
+                title: 'Remove Failed',
+                body: (err && err.message) || 'Unknown error',
+            });
         }
     }
 
@@ -2061,12 +2708,18 @@
         if (idx < 0) return; // Not on an image
 
         e.preventDefault();
+        const isVid = isVideoEntry(idx);
+        const mediaLabel = isVid ? 'Video' : 'Image';
         const menuItems = [
-            { id: 'save', label: 'Save Image', click: () => saveImage(idx) },
-            { id: 'copy', label: 'Copy Image', click: () => copyImage(idx) },
-            { id: 'unpack', label: 'Unpack Image to Eagle', click: () => unpackImage(idx) },
-            { id: 'thumbnail', label: 'Set as Thumbnail', click: () => setAsThumbnail(idx) },
+            { id: 'save', label: `Save ${mediaLabel}`, click: () => saveImage(idx) },
         ];
+        if (!isVid) {
+            menuItems.push({ id: 'copy', label: 'Copy Image', click: () => copyImage(idx) });
+        }
+        menuItems.push(
+            { id: 'unpack', label: `Unpack ${mediaLabel} to Eagle`, click: () => unpackImage(idx) },
+            { id: 'thumbnail', label: 'Set as Thumbnail', click: () => setAsThumbnail(idx) },
+        );
         if (isCBZ) {
             menuItems.push({ id: 'remove', label: 'Remove from Archive', click: () => removeFromArchive(idx) });
         }
@@ -2079,7 +2732,10 @@
         return;
     }
 
-    archiveUtil.listImages(filePath).then(names => {
+    archiveUtil.getSessionToken(filePath).then(token => {
+        sessionToken = token;
+        return archiveUtil.listImages(filePath);
+    }).then(names => {
         imageNames = names;
         if (names.length === 0) {
             console.error('No images found in archive.');

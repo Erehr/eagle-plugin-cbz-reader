@@ -23,15 +23,13 @@
 
     <div class="toolbar" id="toolbar">
         <div class="toolbar-left">
-            <button id="mode-single" class="active" title="Single page">
-                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <button id="pages-toggle" class="state-toggle" title="Single page – click for double page">
+                <svg class="icon" id="pages-single-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <rect width="12" height="20" x="6" y="2" rx="2" />
                 </svg>
-            </button>
-            <button id="mode-double" title="Double page">
-                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <svg class="icon hide" id="pages-double-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+                    fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <rect width="8" height="18" x="2" y="3" rx="2" />
                     <rect width="8" height="18" x="14" y="3" rx="2" />
                 </svg>
@@ -69,7 +67,9 @@
             </button>
             <div class="page-seeker">
                 <span id="page-current" class="page-count">—</span>
-                <input type="range" id="page-slider" class="page-slider" min="1" max="1" value="1" title="Drag to seek page">
+                <input type="range" id="page-slider" class="page-slider" min="1" max="1" value="1"
+                    title="Drag to seek page">
+                <span class="page-sep" aria-hidden="true">/</span>
                 <span id="page-total" class="page-count">—</span>
             </div>
             <button id="btn-next" title="Next (→)">
@@ -112,14 +112,6 @@
                     <rect width="13" height="7" x="8" y="13" rx="1" />
                 </svg>
             </button>
-            <button id="zoom-out" title="Zoom out">
-                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="11" cy="11" r="8" />
-                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                    <line x1="8" y1="11" x2="14" y2="11" />
-                </svg>
-            </button>
             <button id="zoom-reset" title="Zoom: 1× (Click to reset)">
                 <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none"
                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -127,15 +119,6 @@
                     <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
                     <path d="M3 16v3a2 2 0 0 0 2 2h3" />
                     <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
-                </svg>
-            </button>
-            <button id="zoom-in" title="Zoom in">
-                <svg class="icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none"
-                    stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="11" cy="11" r="8" />
-                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                    <line x1="11" y1="8" x2="11" y2="14" />
-                    <line x1="8" y1="11" x2="14" y2="11" />
                 </svg>
             </button>
         </div>

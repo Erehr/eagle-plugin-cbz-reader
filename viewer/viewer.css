@@ -100,8 +100,10 @@ body {
 
 .toolbar .toolbar-left,
 .toolbar .toolbar-right {
-    flex-grow: 1;
-    flex-basis: 0;
+    /* min-width:0 lets the groups participate in shrinking instead of forcing
+       the toolbar wider than the window and pushing buttons out of reach */
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .toolbar .toolbar-left {
@@ -114,8 +116,9 @@ body {
 
 .toolbar .toolbar-center {
     gap: 8px;
-    flex: 0 0 auto;
-    width: 350px;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 350px;
     justify-content: center;
 }
 
@@ -123,7 +126,9 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
+    justify-content: center;
 }
 
 .toolbar .page-count {
@@ -132,6 +137,14 @@ body {
     font-size: 13px;
     font-weight: 500;
     color: var(--color-text-primary);
+    white-space: nowrap;
+}
+
+/* Compact "12 / 340" separator – only shown once the slider is dropped */
+.toolbar .page-sep {
+    display: none;
+    color: var(--color-text-tertiary);
+    font-size: 13px;
 }
 
 .toolbar .page-slider {
@@ -249,6 +262,14 @@ body {
     color: var(--color-text-tertiary);
 }
 
+/* A state toggle is never "off" — its icon *is* the current state, so it must
+   stay fully legible rather than being dimmed like an inactive mode button. */
+.toolbar button.state-toggle .icon,
+.toolbar .toolbar-left button.state-toggle:not(.active) .icon {
+    opacity: 1;
+    color: var(--color-text-primary);
+}
+
 .toolbar .width-btn {
     gap: 4px;
 }
@@ -266,6 +287,70 @@ body {
 
 .toolbar button .icon.gap-off {
     opacity: 0.4;
+}
+
+/* ── Responsive toolbar ─────────────────────────────────────────
+   Buttons never shrink or wrap; the page seeker is the flexible part.
+   With 9 controls the full-size layout needs ~670px with the slider and
+   ~490px without it, so on any realistic window the buttons keep their
+   normal hit area — only the slider is traded away.                 */
+
+.toolbar button {
+    flex: 0 0 auto;
+}
+
+/* Below ~720px the slider is too short to seek with. Drop it and fall back
+   to a compact "current / total" readout. */
+@media (max-width: 720px) {
+    .toolbar .page-slider {
+        display: none;
+    }
+
+    .toolbar .page-sep {
+        display: inline;
+    }
+
+    .toolbar .toolbar-center {
+        flex: 0 0 auto;
+        max-width: none;
+    }
+
+    .toolbar .page-seeker {
+        gap: 4px;
+        flex: 0 0 auto;
+    }
+
+    .toolbar .page-count {
+        min-width: 0;
+    }
+}
+
+/* Only below ~480px is there anything left to reclaim, and even then the
+   icons keep their size — just less air around them. */
+@media (max-width: 480px) {
+    .toolbar {
+        gap: 4px;
+        padding: 0 8px;
+    }
+
+    .toolbar button {
+        padding: 0 7px;
+    }
+}
+
+/* Last resort: scroll the toolbar horizontally rather than clipping
+   controls off-screen. */
+@media (max-width: 380px) {
+    .toolbar {
+        gap: 2px;
+        padding: 0 4px;
+        overflow-x: auto;
+        scrollbar-width: none;
+    }
+
+    .toolbar::-webkit-scrollbar {
+        display: none;
+    }
 }
 
 /* ── Content area ───────────────────────────────────────────── */
@@ -487,6 +572,43 @@ body {
     -webkit-user-drag: none;
     user-select: none;
     border: none;
+}
+
+/* Static pages use explicit pixel boxes from layout — fill avoids object-fit:contain
+   re-centering when a hi-res swap's intrinsic size differs by a few pixels. */
+.reading-body .r-img img:not([data-animated="1"]) {
+    object-fit: fill;
+}
+
+/* ── Video entries ──────────────────────────────────────────── */
+.reading-body .r-img video[data-is-video] {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
+    box-sizing: border-box;
+    object-fit: contain;
+    min-width: 0;
+    min-height: 0;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-drag: none;
+    border: none;
+    outline: none;
+    /* Suppress any browser-default video chrome */
+    -webkit-media-controls: none;
+}
+
+/* Gap support: same inward padding as images */
+.reading-body #reading-track.track-has-gap .r-img video[data-is-video] {
+    padding: 4px;
+}
+
+/* Disable aggressive compositor layer for video containers to prevent texture glitches */
+.reading-body .r-flex:has(video[data-is-video]) {
+    will-change: auto !important;
+    transform: none !important;
 }
 
 /* Uniform gap: padding on the img shrinks it inward without changing any layout dimensions */

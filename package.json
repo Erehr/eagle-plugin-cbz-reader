@@ -1,12 +1,15 @@
 {
     "name": "eagle-cbz-cbr-reader",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Fast CBZ/CBR comic reader with thumbnail support.",
     "private": true,
+    "scripts": {
+        "test": "node tools/test-resize.js"
+    },
     "dependencies": {
+        "@napi-rs/image": "^1.14.0",
         "image-size": "^1.1.1",
         "node-unrar-js": "^2.0.2",
-        "sharp": "^0.32.6",
         "yauzl": "^2.10.0",
         "yazl": "^3.3.1"
     }
