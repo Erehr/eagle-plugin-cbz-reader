@@ -1,7 +1,4 @@
 window-state.json
-node_modules/
-.reference/
 .DS_Store
 Thumbs.db
 *.eagleplugin
-tools/fixtures/
