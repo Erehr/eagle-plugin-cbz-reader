@@ -1,6 +1,6 @@
 {
     "id": "com.eagle.cbz-cbr.reader",
-    "version": "1.0.0",
+    "version": "1.2.0",
     "platform": "all",
     "arch": "all",
     "name": "CBZ Reader",
@@ -13,6 +13,9 @@
         "manga",
         "reader",
         "viewer"
+    ],
+    "dependencies": [
+        "ffmpeg"
     ],
     "devTools": false,
     "main": {

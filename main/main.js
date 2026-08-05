@@ -4,8 +4,22 @@
  */
 const path = require('path');
 const fs = require('fs');
+const urlModule = require('url');
 const pluginRoot = path.join(__dirname, '..');
 const yazl = require(path.join(pluginRoot, 'node_modules', 'yazl'));
+
+/**
+ * Absolute path → file:// URL. Handles the macOS leading slash and escapes
+ * '#', '?' and '%' in filenames, which naive string concatenation does not.
+ */
+function toFileURL(absPath) {
+    try {
+        return urlModule.pathToFileURL(absPath).href;
+    } catch (_) {
+        const p = absPath.replace(/\\/g, '/');
+        return 'file://' + (p.startsWith('/') ? '' : '/') + encodeURI(p);
+    }
+}
 
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif']);
 
@@ -242,7 +256,7 @@ function renderList() {
         if (item.thumbnailURL) {
             thumb.src = item.thumbnailURL;
         } else if (item.filePath) {
-            thumb.src = 'file:///' + item.filePath.replace(/\\/g, '/');
+            thumb.src = toFileURL(item.filePath);
         }
         thumb.alt = '';
         thumb.onerror = () => { thumb.style.display = 'none'; };
