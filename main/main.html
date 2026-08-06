@@ -30,10 +30,17 @@
 
         <footer class="footer">
             <div class="footer-left">
-                <input type="text" id="cbz-name" placeholder="archive" spellcheck="false" autocomplete="off">
+                <div class="name-field" id="name-field">
+                    <input type="text" id="cbz-name" placeholder="archive" spellcheck="false" autocomplete="off"
+                        aria-label="Archive file name">
+                    <span class="name-suffix" id="cbz-suffix">.cbz</span>
+                    <!-- Off-screen twin of the input, used only to measure text width -->
+                    <span class="name-mirror" id="cbz-mirror" aria-hidden="true"></span>
+                </div>
                 <div class="toggle-group">
-                    <input type="checkbox" id="chk-remove-origin">
-                    <label for="chk-remove-origin">Remove original</label>
+                    <input type="checkbox" id="chk-trash-originals">
+                    <label for="chk-trash-originals" title="After the CBZ is created and added to your library, the selected originals are moved to Eagle's Trash.">Move
+                        originals to Trash</label>
                 </div>
             </div>
             <span class="status" id="status"></span>

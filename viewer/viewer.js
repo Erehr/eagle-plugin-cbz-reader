@@ -2531,7 +2531,6 @@
     });
 
     // ── Per-image context menu ──────────────────────────────────────────
-    const isCBZ = pathModule.extname(filePath).toLowerCase() === '.cbz';
 
     function getImageIndexFromEvent(e) {
         let el = e.target;
@@ -2582,75 +2581,6 @@
         } catch (err) {
             console.error('Set thumbnail failed:', err);
             eagle.notification.show({ duration: 3000, title: 'Thumbnail Failed', body: err.message });
-        }
-    }
-
-    async function removeFromArchive(idx) {
-        if (!isCBZ) return;
-        const entryName = imageNames[idx];
-        if (!entryName) return;
-
-        if (imageNames.length <= 1) {
-            eagle.notification.show({
-                duration: 3000,
-                title: 'Remove Failed',
-                body: 'Cannot remove the only page in the archive',
-            });
-            return;
-        }
-
-        const label = getPageLabel(idx);
-        try {
-            const result = await eagle.dialog.showMessageBox({
-                type: 'warning',
-                title: 'Remove from Archive',
-                message: `Remove "${label}" from archive?\n\nThis cannot be undone.`,
-                buttons: ['Cancel', 'Remove'],
-            });
-            if (result.response !== 1) return;
-
-            // Stop all in-flight rendering before the archive is rewritten. Pending
-            // tasks reference the old page indices and the old temp files, and on
-            // Windows an open read handle blocks the archive replacement entirely.
-            renderQueue.clear();
-            renderEpoch++;
-            purgeRenderCache();
-
-            await archiveUtil.removeEntryCBZ(filePath, entryName);
-
-            // Everything below is keyed by page index, and indices just shifted.
-            imagesData = {};
-            imagesFullPosition = {};
-            rightSize = { width: 0, height: 0, scrollHeight: 0 };
-
-            const savedIndex = currentIndex;
-            imageNames = await archiveUtil.listImages(filePath);
-            sessionToken = await archiveUtil.getSessionToken(filePath);
-
-            if (imageNames.length === 0) {
-                readingTrack.innerHTML = '<div style="padding:20px;text-align:center;color:var(--color-text-tertiary)">Archive is empty</div>';
-                indexNum = 0;
-                updatePageInfo();
-                return;
-            }
-
-            // Rebuild through applyView so layout classes, gap state and the
-            // slide/scroll track are all reconstructed consistently.
-            readingTrack.innerHTML = '';
-            readingTrack.className = '';
-            updateIndexNum();
-            currentIndex = Math.max(1, Math.min(savedIndex, indexNum));
-            addHtmlImages();
-            applyView();
-
-            eagle.notification.show({ duration: 3000, title: 'Image Removed', body: label });
-        } catch (err) {
-            console.error('Remove failed:', err);
-            eagle.notification.show({
-                duration: 3000,
-                title: 'Remove Failed',
-                body: (err && err.message) || 'Unknown error',
-            });
         }
     }
 
@@ -2720,9 +2650,6 @@
             { id: 'unpack', label: `Unpack ${mediaLabel} to Eagle`, click: () => unpackImage(idx) },
             { id: 'thumbnail', label: 'Set as Thumbnail', click: () => setAsThumbnail(idx) },
         );
-        if (isCBZ) {
-            menuItems.push({ id: 'remove', label: 'Remove from Archive', click: () => removeFromArchive(idx) });
-        }
         eagle.contextMenu.open(menuItems);
     }
 

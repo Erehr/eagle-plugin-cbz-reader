@@ -23,8 +23,61 @@ function toFileURL(absPath) {
 
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif']);
 
+// ── Archive name validation ─────────────────────────────────
+
+/** Illegal in a filename on at least one supported platform (non-global: `test` must be stateless). */
+const ILLEGAL_NAME_CHARS = /[<>:"/\\|?*\u0000-\u001f]/;
+/** Same set, global, for stripping as the user types. */
+const ILLEGAL_NAME_CHARS_G = /[<>:"/\\|?*\u0000-\u001f]/g;
+/** Windows reserves these device names whatever extension follows. */
+const RESERVED_BASENAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+/**
+ * Validate the typed archive name as a *single* file basename.
+ *
+ * The name is joined to a temp directory to create a file, so it must not be
+ * able to describe anything other than a direct child of that directory. Path
+ * separators, '.'/'..' and drive-relative forms are rejected outright rather
+ * than quietly rewritten, so the file that gets created is always the one whose
+ * name the user can see in the input.
+ *
+ * @returns {{ok: true, name: string} | {ok: false, reason: string}}
+ */
+function validateArchiveName(input) {
+    const name = String(input == null ? '' : input).trim().replace(/\.cbz$/i, '').trim();
+
+    if (!name) return { ok: false, reason: 'Enter a file name' };
+    if (name.length > 120) return { ok: false, reason: 'File name is too long' };
+    if (/[/\\]/.test(name)) return { ok: false, reason: 'File name cannot contain / or \\' };
+    if (ILLEGAL_NAME_CHARS.test(name)) return { ok: false, reason: 'File name contains an invalid character' };
+    if (name === '.' || name === '..' || name.startsWith('.')) return { ok: false, reason: 'File name cannot start with a dot' };
+    if (/[. ]$/.test(name)) return { ok: false, reason: 'File name cannot end with a dot or space' };
+    if (RESERVED_BASENAMES.test(name)) return { ok: false, reason: 'That file name is reserved by the system' };
+    if (path.basename(name) !== name) return { ok: false, reason: 'File name must not contain a path' };
+
+    return { ok: true, name };
+}
+
+/**
+ * Resolve `name` to an absolute path that is provably a direct child of `dir`.
+ * The final gate before anything is created on disk.
+ *
+ * @returns {string|null}
+ */
+function resolveInside(dir, name) {
+    if (typeof name !== 'string' || !name || name === '.' || name === '..') return null;
+    if (name.includes('/') || name.includes('\\') || name.includes('\0')) return null;
+
+    const root = path.resolve(dir);
+    const target = path.resolve(root, name);
+    const rel = path.relative(root, target);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(path.sep)) return null;
+    return target;
+}
+
 let items = []; // Eagle Item objects
-let listEl, emptyEl, nameInput, btnCreate, statusEl, titlebarText, chkRemoveOrigin;
+let listEl, emptyEl, nameInput, btnCreate, statusEl, titlebarText, chkTrashOriginals;
+let nameField, nameMirror, nameSuffix;
 let dragReorder = { fromIndex: -1 }; // drag-to-reorder state
 
 // ── Eagle lifecycle ─────────────────────────────────────────
@@ -38,24 +91,43 @@ eagle.onPluginCreate((plugin) => {
     btnCreate = document.getElementById('btn-create');
     statusEl = document.getElementById('status');
     titlebarText = document.getElementById('titlebar-text');
-    chkRemoveOrigin = document.getElementById('chk-remove-origin');
+    chkTrashOriginals = document.getElementById('chk-trash-originals');
+    nameField = document.getElementById('name-field');
+    nameMirror = document.getElementById('cbz-mirror');
+    nameSuffix = document.getElementById('cbz-suffix');
 
-    // Restore persistent toggle state (unchecked by default)
-    const storedToggle = localStorage.getItem('eagle-cbz-remove-origin');
-    if (storedToggle === 'true') {
-        chkRemoveOrigin.checked = true;
-    } else {
-        chkRemoveOrigin.checked = false;
-    }
-    chkRemoveOrigin.addEventListener('change', () => {
-        localStorage.setItem('eagle-cbz-remove-origin', chkRemoveOrigin.checked);
-    });
+    // Deliberately not remembered between runs. This option deletes user
+    // content, so it always starts off and has to be an explicit choice each
+    // time rather than something left switched on from a previous session.
+    chkTrashOriginals.checked = false;
 
     btnCreate.addEventListener('click', createCBZ);
     nameInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') createCBZ();
     });
-    nameInput.addEventListener('input', updateButtonState);
+    nameInput.addEventListener('input', () => {
+        // Characters that cannot appear in a filename are dropped as they are
+        // typed, so the field can never show a name we would have to reject.
+        const cleaned = nameInput.value.replace(ILLEGAL_NAME_CHARS_G, '');
+        if (cleaned !== nameInput.value) {
+            const caret = nameInput.selectionStart - (nameInput.value.length - cleaned.length);
+            nameInput.value = cleaned;
+            nameInput.setSelectionRange(caret, caret);
+        }
+        onNameChanged();
+    });
+    // The input is only as wide as its text, so clicking the empty part of the
+    // field would otherwise do nothing.
+    nameField.addEventListener('mousedown', e => {
+        if (e.target !== nameInput) {
+            e.preventDefault();
+            nameInput.focus();
+            nameInput.setSelectionRange(nameInput.value.length, nameInput.value.length);
+        }
+    });
+
+    window.addEventListener('resize', syncNameSuffix);
+    onNameChanged();
 
     // Close button (frameless window)
     const btnClose = document.getElementById('btn-close');
@@ -85,7 +157,31 @@ eagle.onPluginShow(() => {
 function resetWindow() {
     items = [];
     nameInput.value = '';
+    // The window is created once and reused, so clear the toggle here too —
+    // otherwise it would stay switched on for the next run from the last one.
+    if (chkTrashOriginals) chkTrashOriginals.checked = false;
     updateUI();
+}
+
+// ── Name field ──────────────────────────────────────────────
+
+function onNameChanged() {
+    updateButtonState();
+    syncNameSuffix();
+}
+
+/**
+ * Keep the ".cbz" suffix sitting immediately after the typed text instead of
+ * floating at the far edge of the field, so it reads as part of the filename
+ * rather than as a separate label. A hidden mirror span rendered in the input's
+ * own font gives the exact text width.
+ */
+function syncNameSuffix() {
+    if (!nameField || !nameMirror) return;
+    nameMirror.textContent = nameInput.value || nameInput.placeholder || '';
+    const available = nameField.clientWidth - nameSuffix.offsetWidth - 26;
+    const width = Math.min(Math.max(nameMirror.offsetWidth + 1, 8), Math.max(available, 8));
+    nameInput.style.width = width + 'px';
 }
 
 // ── Load selected images ────────────────────────────────────
@@ -115,10 +211,10 @@ async function loadSelected() {
             try {
                 const folders = await eagle.folder.getSelected();
                 if (folders && folders.length > 0 && folders[0].name) {
-                    nameInput.value = folders[0].name;
+                    nameInput.value = folders[0].name.replace(ILLEGAL_NAME_CHARS_G, '');
                 }
             } catch (_) { }
-            updateButtonState();
+            onNameChanged();
         }
     } catch (err) {
         console.error('Failed to load selected items:', err);
@@ -192,12 +288,12 @@ function updateUI() {
         statusEl.textContent = ''; // Clear status to favor space for packing feedback
     }
 
-    updateButtonState();
+    onNameChanged();
     renderList();
 }
 
 function updateButtonState() {
-    btnCreate.disabled = items.length === 0 || !nameInput.value.trim();
+    btnCreate.disabled = items.length === 0 || !validateArchiveName(nameInput.value).ok;
 }
 
 function renderList() {
@@ -305,14 +401,60 @@ function formatSize(bytes) {
 
 // ── Create CBZ ──────────────────────────────────────────────
 
+/**
+ * Confirm the destructive half of the operation before any of it starts.
+ *
+ * "Move originals to Trash" is opt-in and remembered between runs, which means
+ * it can be on without the user thinking about it on this particular run — so
+ * it is spelled out with a count, and asked *before* the archive is built so
+ * cancelling leaves nothing behind to undo.
+ */
+async function confirmTrashOriginals(archiveName, count) {
+    try {
+        const result = await eagle.dialog.showMessageBox({
+            type: 'warning',
+            title: 'Move originals to Trash',
+            message: `Create ${archiveName}.cbz and move ${count} original ${count === 1 ? 'item' : 'items'} to Trash?`,
+            detail: 'The originals go to Eagle\'s Trash, where you can restore them until you empty it.',
+            buttons: ['Cancel', 'Create and Move to Trash'],
+            defaultId: 0,
+            cancelId: 0,
+        });
+        return result && result.response === 1;
+    } catch (err) {
+        // A dialog we cannot show is not consent — fail closed.
+        console.error('Confirmation dialog failed:', err);
+        return false;
+    }
+}
+
 async function createCBZ() {
     if (items.length === 0) return;
 
-    const archiveName = (nameInput.value.trim() || 'archive');
+    const check = validateArchiveName(nameInput.value);
+    if (!check.ok) {
+        statusEl.textContent = check.reason;
+        nameInput.focus();
+        return;
+    }
+    const archiveName = check.name;
+
+    // Only Eagle-sourced items can be trashed; files dropped onto the window
+    // are not in the library and are never touched.
+    const trashIds = chkTrashOriginals.checked
+        ? items.filter(x => !String(x.id).startsWith('drop_')).map(x => x.id)
+        : [];
+
+    if (trashIds.length > 0 && !(await confirmTrashOriginals(archiveName, trashIds.length))) {
+        statusEl.textContent = 'Cancelled';
+        return;
+    }
+
     btnCreate.disabled = true;
     btnCreate.classList.add('working');
     statusEl.textContent = 'Creating CBZ…';
 
+    let tmpDir = null;
     try {
         // Determine target folder: currently selected folder in Eagle
         let targetFolders = [];
@@ -323,14 +465,20 @@ async function createCBZ() {
             }
         } catch (_) { }
 
-        // Build CBZ in temp directory
-        const tmpDir = path.join(eagle.os.tmpdir(), 'eagle-cbz-creator-' + Date.now());
-        fs.mkdirSync(tmpDir, { recursive: true });
-        const tmpFile = path.join(tmpDir, archiveName + '.cbz');
+        // Build CBZ in a temp directory of our own.
+        //
+        // mkdtemp rather than mkdir: it returns a directory that is guaranteed
+        // not to have existed, so nothing already on disk can be reached from
+        // here. The filename is then resolved against that directory and checked
+        // to be a direct child of it before anything is created, and the stream
+        // opens with 'wx' so an existing file is reported rather than truncated.
+        tmpDir = fs.mkdtempSync(path.join(eagle.os.tmpdir(), 'eagle-cbz-creator-'));
+        const tmpFile = resolveInside(tmpDir, archiveName + '.cbz');
+        if (!tmpFile) throw new Error('Invalid file name');
 
         await new Promise((resolve, reject) => {
             const zip = new yazl.ZipFile();
-            const ws = fs.createWriteStream(tmpFile);
+            const ws = fs.createWriteStream(tmpFile, { flags: 'wx' });
             zip.outputStream.pipe(ws);
 
             // Track filenames to avoid duplicates
@@ -378,29 +526,22 @@ async function createCBZ() {
         if (targetFolders.length > 0) opts.folders = targetFolders;
         await eagle.item.addFromPath(tmpFile, opts);
 
-        // Check if user requested deletions of the original files that were correctly sourced from Eagle
-        if (chkRemoveOrigin.checked) {
-            const idsToDelete = items.filter(x => !x.id.startsWith('drop_')).map(x => x.id);
-            if (idsToDelete.length > 0) {
-                statusEl.textContent = 'Trashing originals…';
-                try {
-                    // Use web api instead of plugin API because it allows bulk operation by providing item ID array
-                    await fetch('http://127.0.0.1:41595/api/item/moveToTrash', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ itemIds: idsToDelete })
-                    });
-                } catch (e) {
-                    console.error('Failed to bulk trash items via generic API:', e);
-                }
+        // Trash the originals only after the new archive is safely in the library.
+        // Confirmed up front, so by this point consent is already on record.
+        if (trashIds.length > 0) {
+            statusEl.textContent = 'Moving originals to Trash…';
+            try {
+                // The local HTTP API is used rather than the plugin API because it
+                // takes an array of item IDs, so this is one call instead of N.
+                await fetch('http://127.0.0.1:41595/api/item/moveToTrash', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ itemIds: trashIds })
+                });
+            } catch (e) {
+                console.error('Failed to bulk trash items via generic API:', e);
             }
         }
-
-        // Cleanup temp
-        try {
-            fs.unlinkSync(tmpFile);
-            fs.rmdirSync(tmpDir);
-        } catch (_) { }
 
         statusEl.textContent = 'Done! ' + archiveName + '.cbz created';
         eagle.notification.show({
@@ -422,11 +563,25 @@ async function createCBZ() {
             body: err.message,
         });
     } finally {
+        // Remove the whole session directory, not just the file we know about,
+        // so a partially written archive never lingers in temp.
+        if (tmpDir) {
+            try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { }
+        }
         btnCreate.disabled = false;
         btnCreate.classList.remove('working');
     }
 }
 
+/**
+ * Flatten an Eagle item name into an entry name for inside the archive.
+ * Directory separators and characters that are illegal on any supported
+ * platform are replaced, so an odd item name cannot shape the zip's structure.
+ */
 function sanitize(name) {
-    return name.replace(/[<>:"/\\|?*]/g, '_').replace(/\s+/g, '_');
+    return String(name == null ? '' : name)
+        .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/^\.+/, '')
+        .slice(0, 80) || 'image';
 }

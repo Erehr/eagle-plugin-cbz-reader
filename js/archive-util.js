@@ -17,7 +17,6 @@ const PLUGIN_ROOT = path.join(__dirname, '..');
 const requireYauzl = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'yauzl'));
 const requireUnrar = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'node-unrar-js'));
 const requireImageSize = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'image-size'));
-const requireYazl = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'yazl'));
 const imageFormat = require(path.join(__dirname, 'image-format.js'));
 
 const IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'];
@@ -66,9 +65,64 @@ function naturalSort(a, b) {
 function isCBZ(fp) { return path.extname(fp).toLowerCase() === '.cbz'; }
 function isCBR(fp) { return path.extname(fp).toLowerCase() === '.cbr'; }
 
-function safeName(entryName) {
-    // Flatten any directory structure into a single filename to avoid path issues
-    return entryName.replace(/[/\\]/g, '__');
+/** Longest entry-derived suffix we keep, so the final basename stays well under filesystem limits */
+const MAX_SAFE_STEM = 64;
+
+/**
+ * Extensions we are willing to put on a file we create in the temp directory.
+ * An entry name inside an archive is attacker-controlled, so the extension is
+ * taken from an allowlist rather than from the entry itself.
+ */
+const SAFE_EXT_SET = new Set(MEDIA_EXT.map(e => e.toLowerCase()));
+
+/**
+ * Build a flat, filesystem-safe basename for an archive entry.
+ *
+ * Entry names are untrusted input: they can carry directory components, '..'
+ * segments, drive letters, NTFS stream separators or control characters, any
+ * of which can make a write land outside the session temp directory. So the
+ * entry name is never used as a path here — it only contributes a cosmetic
+ * suffix. `index` is what actually makes the result unique, which means
+ * collisions are impossible by construction rather than by checking for them.
+ *
+ * @param {string} entryName - path of the entry inside the archive
+ * @param {number} index - position of the entry in the session's sorted list
+ * @returns {string} a basename with no directory components
+ */
+function safeEntryFileName(entryName, index) {
+    const base = String(entryName == null ? '' : entryName).replace(/^.*[\\/]/, '');
+
+    const rawExt = path.extname(base).toLowerCase();
+    const ext = SAFE_EXT_SET.has(rawExt) ? rawExt : '.bin';
+
+    const stem = base
+        .slice(0, base.length - path.extname(base).length)
+        .replace(/[^A-Za-z0-9._-]+/g, '_')  // strips separators, colons, control chars, unicode
+        .replace(/^[._]+/, '')              // never a leading dot: no hidden files, no '..'
+        .replace(/_{2,}/g, '_')
+        .slice(0, MAX_SAFE_STEM);
+
+    return 'p' + String(index).padStart(6, '0') + (stem ? '_' + stem : '') + ext;
+}
+
+/**
+ * Resolve `name` to an absolute path directly inside `dir`, or return null.
+ *
+ * Belt and braces on top of safeEntryFileName: even a name that already looks
+ * flat is re-checked after resolution, so anything that would escape the
+ * directory — or land in a subdirectory of it — is rejected instead of written.
+ *
+ * @returns {string|null} absolute path, guaranteed to be an immediate child of `dir`
+ */
+function resolveInside(dir, name) {
+    if (typeof name !== 'string' || name === '' || name === '.' || name === '..') return null;
+    if (name.includes('/') || name.includes('\\') || name.includes('\0')) return null;
+
+    const root = path.resolve(dir);
+    const target = path.resolve(root, name);
+    const rel = path.relative(root, target);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(path.sep)) return null;
+    return target;
 }
 
 // ── Per-Archive Session ──────────────────────────────────────────────────
@@ -98,6 +152,15 @@ class ArchiveSession {
         this.token = 'sess_' + (++_sessionSeq) + '_' + Date.now();
         /** Sorted list of entry names (inside-archive paths) */
         this.imageEntries = imageEntries;
+        /**
+         * entryName → flat on-disk basename, precomputed from the sorted entry
+         * list. Every extraction target comes from here, so no untrusted string
+         * from an archive ever reaches path.join, and two entries can never
+         * resolve to the same file.
+         */
+        this.safeNames = new Map(imageEntries.map((n, i) => [n, safeEntryFileName(n, i)]));
+        /** Counter for names assigned to entries that were not in the listing */
+        this._extraSeq = 0;
         /** Map<index, absoluteFilePath> – tracks which pages are extracted */
         this.extracted = new Map();
         /** Map<index, {width, height}> – dimension cache */
@@ -125,6 +188,34 @@ class ArchiveSession {
     /** Absolute path for a page's extracted file */
     pathForIndex(index) {
         return this.extracted.get(index) || null;
+    }
+
+    /**
+     * Flat on-disk basename for an entry.
+     *
+     * Precomputed for every entry we listed. Anything else — a sibling that
+     * unrar decides to unpack while resolving a solid block, say — gets a name
+     * assigned here on the spot, so it still lands somewhere harmless inside
+     * the temp directory instead of wherever the archive asked for. Indices for
+     * these start past the end of the entry list, so they cannot collide with a
+     * real page.
+     */
+    diskNameFor(entryName) {
+        let name = this.safeNames.get(entryName);
+        if (!name) {
+            name = safeEntryFileName(entryName, this.imageEntries.length + (this._extraSeq++));
+            this.safeNames.set(entryName, name);
+        }
+        return name;
+    }
+
+    /**
+     * Absolute path to write an entry to, verified to sit directly inside this
+     * session's temp directory. Returns null only if the name somehow still
+     * fails the containment check, in which case callers skip the entry.
+     */
+    targetPathFor(entryName) {
+        return resolveInside(this.tmpDir, this.diskNameFor(entryName));
     }
 
     /** Purge extracted files far from `centerIndex`. Throttled so we don't purge on every getImagePath. */
@@ -248,11 +339,14 @@ function listEntriesCBZ(src) {
 /** How many pages to decompress at once. Above ~4 the disk writes start to thrash. */
 const EXTRACT_CONCURRENCY = 4;
 
-function extractOneCBZ(zipfile, entry, tmpDir) {
+function extractOneCBZ(zipfile, entry, session) {
+    const outPath = session.targetPathFor(entry.fileName);
+    if (!outPath) {
+        return Promise.reject(new Error('Unsafe archive entry name: ' + entry.fileName));
+    }
     return new Promise((resolve, reject) => {
         zipfile.openReadStream(entry, (errS, stream) => {
             if (errS) return reject(errS);
-            const outPath = path.join(tmpDir, safeName(entry.fileName));
             const ws = fs.createWriteStream(outPath);
             stream.on('error', reject);
             ws.on('error', reject);
@@ -284,7 +378,7 @@ async function extractBatchCBZ(session, targetNames) {
                 const entry = entryMap.get(name);
                 if (!entry) continue;
                 try {
-                    const outPath = await extractOneCBZ(zip, entry, session.tmpDir);
+                    const outPath = await extractOneCBZ(zip, entry, session);
                     results.set(name, outPath);
                 } catch (err) {
                     console.error('[archive-util] extract failed for', name, err && err.message);
@@ -312,45 +406,60 @@ async function listEntriesCBR(src) {
 
 // ── CBR: extract a batch to temp dir ─────────────────────────────────────
 
-async function extractBatchCBR(src, tmpDir, targetNames, session) {
+/**
+ * Extract the requested entries from a CBR into the session temp directory.
+ *
+ * `filenameTransform` is what makes this safe. node-unrar-js builds each output
+ * path as `path.join(targetPath, filenameTransform(entryName))`, and with the
+ * default identity transform an entry named '../../x.jpg' — or an absolute path
+ * — is written wherever it asks, outside the directory we meant to confine it
+ * to. Worse, the code that later reads, re-renders or unlinks that file would
+ * follow it straight out of the temp directory.
+ *
+ * Mapping every entry through `diskNameFor` means the transform can only ever
+ * return a flat basename we generated, so the join has nothing to escape with.
+ * The same mapping is used to find the file again afterwards, so the two can
+ * never disagree.
+ */
+async function extractBatchCBR(src, session, targetNames) {
     const unrar = requireUnrar();
     // Reuse one extractor per session: creating it re-reads and re-parses the RAR
     // headers every time, which is the dominant cost on large CBRs.
-    let ext = session && session._unrar;
+    let ext = session._unrar;
     if (!ext) {
         ext = await unrar.createExtractorFromFile({
             filepath: src,
-            targetPath: tmpDir,
+            targetPath: session.tmpDir,
+            filenameTransform: name => session.diskNameFor(name),
         });
-        if (session) session._unrar = ext;
+        session._unrar = ext;
     }
-    const extracted = ext.extract({ files: targetNames });
-    const files = [...extracted.files]; // force iteration
+
+    // The generator must be drained to the end even if we stop caring about the
+    // results — the native archive object is only destructed once it completes.
+    const unpacked = [];
+    for (const file of ext.extract({ files: targetNames }).files) {
+        const name = file.fileHeader && file.fileHeader.name;
+        if (name && !(file.fileHeader.flags && file.fileHeader.flags.directory)) unpacked.push(name);
+    }
 
     const results = new Map();
-    for (const name of targetNames) {
-        const normalized = name.replace(/\\/g, path.sep);
-        const fullPath = path.join(tmpDir, normalized);
-        const altPath = path.join(tmpDir, path.basename(name));
-        const safePath = path.join(tmpDir, safeName(name));
+    if (session.destroyed) return results;
 
-        // node-unrar-js preserves directory structure; find the file
-        let readPath = null;
-        if (fs.existsSync(fullPath)) readPath = fullPath;
-        else if (fs.existsSync(altPath)) readPath = altPath;
-        else if (fs.existsSync(safePath)) readPath = safePath;
-
-        if (readPath) {
-            // Move to flat safe name if needed
-            if (readPath !== safePath) {
-                try {
-                    fs.renameSync(readPath, safePath);
-                    readPath = safePath;
-                } catch (_) { }
-            }
-            results.set(name, readPath);
+    for (const name of unpacked) {
+        const outPath = session.targetPathFor(name);
+        if (!outPath) {
+            console.warn('[archive-util] skipping unsafe archive entry name:', name);
+            continue;
         }
+        // Confirm the transform actually produced the file we expect, rather
+        // than trusting that extraction succeeded.
+        try {
+            fs.accessSync(outPath);
+            results.set(name, outPath);
+        } catch (_) { /* entry failed to unpack; caller treats it as missing */ }
     }
+
     return results;
 }
 
@@ -397,8 +506,10 @@ async function getSession(archivePath) {
     if (pendingSessions.has(normPath)) return pendingSessions.get(normPath);
 
     const work = (async () => {
-        const tmpDir = path.join(os.tmpdir(), `eagle-cbr-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        fs.mkdirSync(tmpDir, { recursive: true });
+        // mkdtemp rather than mkdir: it creates a directory that is guaranteed
+        // not to have existed, so a session can never inherit — or clobber —
+        // files left behind by anything else in the system temp directory.
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eagle-cbr-'));
 
         let entries, zip = null, entryMap = null;
         try {
@@ -484,7 +595,7 @@ async function ensureExtracted(filePath, centerIndex, abortToken) {
             if (isCBZ(normPath)) {
                 results = await extractBatchCBZ(session, neededNames);
             } else {
-                results = await extractBatchCBR(normPath, session.tmpDir, neededNames, session);
+                results = await extractBatchCBR(normPath, session, neededNames);
             }
 
             for (const idx of needed) {
@@ -546,7 +657,7 @@ async function getImagePathsInRange(filePath, indices, abortToken) {
             if (isCBZ(normPath)) {
                 results = await extractBatchCBZ(session, neededNames);
             } else {
-                results = await extractBatchCBR(normPath, session.tmpDir, neededNames, session);
+                results = await extractBatchCBR(normPath, session, neededNames);
             }
 
             for (const idx of needed) {
@@ -877,7 +988,10 @@ async function renderAtScale(filePath, index, targetPixelWidth) {
 
         const format = detectPageFormat(session, index, originalPath) || 'jpeg';
         const { ext, encode } = encoderFor(format);
-        const outPath = path.join(session.tmpDir, cacheKey + ext);
+        // cacheKey is built from a number, but route it through the same check
+        // as archive entries so every write in this module has one gatekeeper.
+        const outPath = resolveInside(session.tmpDir, cacheKey + ext);
+        if (!outPath) return null;
 
         // fastResize is the SIMD path; Lanczos3 matches the quality of the
         // previous libvips output closely enough to be indistinguishable on
@@ -949,196 +1063,6 @@ function cleanupAll() {
     sessions.clear();
 }
 
-// ── CBZ: remove entry without re-compression ────────────────────────────
-
-/**
- * Remove a single entry from a CBZ (ZIP) archive.
- * Uses yauzl to read raw compressed streams and yazl to write them
- * into a new archive, skipping the entry to delete. No re-compression.
- * Atomically replaces the original file.
- */
-/** Busy-wait a few ms without pulling in a dependency (only used on the rename retry path). */
-function sleepSync(ms) {
-    const end = Date.now() + ms;
-    while (Date.now() < end) { /* spin */ }
-}
-
-/**
- * Replace `dest` with `src`. Retries because on Windows a lingering handle on the
- * destination (Eagle's own preview, an antivirus scanner, a just-closed read
- * stream) makes rename fail with EPERM/EBUSY for a few tens of milliseconds.
- */
-function replaceFileWithRetry(src, dest, attempts = 8) {
-    let lastErr;
-    for (let i = 0; i < attempts; i++) {
-        try {
-            fs.renameSync(src, dest);
-            return;
-        } catch (err) {
-            lastErr = err;
-            if (err && (err.code === 'EXDEV')) {
-                // Different volume: rename can never work here
-                fs.copyFileSync(src, dest);
-                try { fs.unlinkSync(src); } catch (_) { }
-                return;
-            }
-            sleepSync(40 + i * 30);
-        }
-    }
-    // Last resort: overwrite in place rather than replacing the directory entry
-    try {
-        fs.copyFileSync(src, dest);
-        try { fs.unlinkSync(src); } catch (_) { }
-        return;
-    } catch (_) { }
-    throw lastErr;
-}
-
-function rewriteCBZWithout(archivePath, entryNames) {
-    return new Promise((resolve, reject) => {
-        const yauzl = requireYauzl();
-        const yazl = requireYazl();
-        const tmpOut = archivePath + '.tmp-' + process.pid + '-' + Date.now();
-        const skipSet = new Set(entryNames);
-
-        let settled = false;
-        let zipfileRef = null;
-        const fail = err => {
-            if (settled) return;
-            settled = true;
-            try { if (zipfileRef) zipfileRef.close(); } catch (_) { }
-            try { fs.unlinkSync(tmpOut); } catch (_) { }
-            reject(err);
-        };
-
-        yauzl.open(archivePath, { lazyEntries: true, autoClose: false }, (err, zipfile) => {
-            if (err) return fail(err);
-            zipfileRef = zipfile;
-
-            const outZip = new yazl.ZipFile();
-            const ws = fs.createWriteStream(tmpOut);
-            outZip.outputStream.pipe(ws);
-
-            let kept = 0;
-
-            // The source file handle and the destination stream close independently.
-            // On Windows, renaming over a file that still has an open handle fails with
-            // EPERM/EBUSY — so we wait for BOTH before replacing the original.
-            let writeDone = false;
-            let readDone = false;
-            const finishIfReady = () => {
-                if (settled || !writeDone || !readDone) return;
-                settled = true;
-
-                if (kept === 0) {
-                    try { fs.unlinkSync(tmpOut); } catch (_) { }
-                    return reject(new Error('Refusing to write an empty archive'));
-                }
-
-                try {
-                    // Sanity check: the rewritten file must be a plausible zip
-                    const st = fs.statSync(tmpOut);
-                    if (st.size <= 22) throw new Error('Rewritten archive is empty or corrupted');
-                    replaceFileWithRetry(tmpOut, archivePath);
-                } catch (e) {
-                    try { fs.unlinkSync(tmpOut); } catch (_) { }
-                    return reject(e);
-                }
-
-                resolve(kept);
-            };
-
-            zipfile.readEntry();
-            zipfile.on('entry', entry => {
-                if (settled) return;
-                if (skipSet.has(entry.fileName)) {
-                    // Skip this entry
-                    zipfile.readEntry();
-                    return;
-                }
-
-                if (/\/$/.test(entry.fileName)) {
-                    // Directory entry
-                    try {
-                        outZip.addEmptyDirectory(entry.fileName, { mtime: entry.getLastModDate() });
-                    } catch (_) { /* yazl rejects some odd paths; dropping an empty dir is harmless */ }
-                    zipfile.readEntry();
-                } else {
-                    // File entry: read uncompressed data and let yazl re-compress if originally compressed.
-                    // Piping raw deflated bytes into yazl(compress: false) corrupts the archive's CRC32 signature.
-                    zipfile.openReadStream(entry, (errS, stream) => {
-                        if (errS) return fail(errS);
-                        try {
-                            outZip.addReadStream(stream, entry.fileName, {
-                                mtime: entry.getLastModDate(),
-                                compress: entry.compressionMethod !== 0, // match original
-                                size: entry.uncompressedSize,
-                            });
-                            kept++;
-                        } catch (e) {
-                            return fail(e);
-                        }
-                        stream.on('error', fail);
-                        stream.on('end', () => { if (!settled) zipfile.readEntry(); });
-                    });
-                }
-            });
-
-            zipfile.on('end', () => {
-                // All entries queued. close() unrefs the fd; the actual fs.close is async,
-                // so wait for the 'close' event rather than assuming the handle is gone.
-                outZip.end();
-                zipfile.on('close', () => { readDone = true; finishIfReady(); });
-                zipfile.close();
-                // yauzl only emits 'close' when autoClose owns the fd; guard with a fallback
-                // so we never hang if the event does not arrive.
-                setTimeout(() => { readDone = true; finishIfReady(); }, 250);
-            });
-
-            ws.on('finish', () => { writeDone = true; finishIfReady(); });
-            ws.on('error', fail);
-            zipfile.on('error', fail);
-        });
-    });
-}
-
-/**
- * Remove one or more entries from a CBZ.
- * Serialized against in-flight extraction for the same archive: on Windows an
- * open read handle from a background preload batch makes the rename fail, which
- * is what made "Remove from Archive" appear broken.
- */
-async function removeEntryCBZ(archivePath, entryName) {
-    const normPath = path.normalize(archivePath);
-    const names = Array.isArray(entryName) ? entryName : [entryName];
-    const session = sessions.get(normPath);
-
-    const run = async () => {
-        if (session) {
-            // Release the long-lived read handle. On Windows the rename below fails
-            // with EPERM while any handle on the archive is still open — this was
-            // the main reason "Remove from Archive" silently failed.
-            session.closeArchive();
-            // Drop our own extracted copies too; they are about to be stale anyway.
-            for (const [idx, fp] of session.extracted) {
-                try { fs.unlinkSync(fp); } catch (_) { }
-                session.extracted.delete(idx);
-            }
-            // Give the OS a tick to actually release the descriptor
-            await new Promise(r => setTimeout(r, 30));
-        }
-        await rewriteCBZWithout(normPath, names);
-        // Invalidate session cache so the next listImages() re-reads from disk
-        const live = sessions.get(normPath);
-        if (live) live.destroy();
-    };
-
-    if (!session) return run();
-
-    // Queue behind any pending extraction so no read stream is open on the archive.
-    return session.runExclusive(run);
-}
-
 // Cleanup on process exit
 process.on('exit', cleanupAll);
 process.on('SIGINT', () => { cleanupAll(); process.exit(); });
@@ -1155,7 +1079,6 @@ module.exports = {
     getSessionToken,
     renderAtScale,
     isPageAnimated,
-    removeEntryCBZ,
     cleanup,
     cleanupAll,
     isImageFileName,

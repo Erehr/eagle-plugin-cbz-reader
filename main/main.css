@@ -254,8 +254,10 @@ body {
     align-items: center;
     gap: 6px;
     font-size: 13px;
+    line-height: 1.2;
     color: var(--color-text-secondary);
-    margin-left: 8px;
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 .toggle-group input[type="checkbox"] {
@@ -307,14 +309,14 @@ body {
     padding: 0 16px;
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
 }
 
 .footer-left {
     flex: 1;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 12px;
     min-width: 0;
 }
 
@@ -324,27 +326,71 @@ body {
     flex-shrink: 0;
 }
 
-.footer-left input {
-    flex: 1;
-    min-width: 80px;
+/* ── Name field (input + inline .cbz suffix) ─────────────── */
+
+/*
+ * The field is the bordered box; the <input> inside it is chrome-free and
+ * sized to its own text, so the ".cbz" suffix sits directly after what the
+ * user typed. Clicking anywhere in the box focuses the input.
+ */
+.name-field {
+    flex: 1 1 auto;
+    min-width: 96px;
+    display: flex;
+    align-items: center;
     height: 36px;
-    line-height: 36px;
     padding: 0 12px;
     background: rgba(0, 0, 0, 0.2);
     border: 1px solid var(--color-border-primary);
     border-radius: 6px;
-    color: var(--color-text-primary);
-    font-size: 13px;
-    outline: none;
+    cursor: text;
+    overflow: hidden;
     transition: border-color 150ms;
 }
 
-.footer-left input::placeholder {
+.name-field:focus-within {
+    border-color: var(--color-primary);
+}
+
+.name-field input#cbz-name {
+    min-width: 8px;
+    height: 34px;
+    line-height: 34px;
+    padding: 0;
+    background: none;
+    border: none;
+    border-radius: 0;
+    color: var(--color-text-primary);
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+}
+
+.name-field input#cbz-name::placeholder {
     color: rgba(248, 249, 251, 0.25);
 }
 
-.footer-left input:focus {
-    border-color: var(--color-primary);
+.name-suffix {
+    flex-shrink: 0;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--color-text-tertiary, rgba(248, 249, 251, 0.4));
+    user-select: none;
+    pointer-events: none;
+}
+
+/*
+ * Measuring twin. Must match the input's typography exactly or the suffix
+ * lands in the wrong place; kept out of flow so it never affects layout.
+ */
+.name-mirror {
+    position: absolute;
+    visibility: hidden;
+    white-space: pre;
+    left: -9999px;
+    top: 0;
+    font-size: 13px;
+    font-family: inherit;
 }
 
 .footer .status {
