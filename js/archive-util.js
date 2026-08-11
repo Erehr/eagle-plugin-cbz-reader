@@ -18,6 +18,7 @@ const requireYauzl = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'yauzl
 const requireUnrar = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'node-unrar-js'));
 const requireImageSize = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'image-size'));
 const imageFormat = require(path.join(__dirname, 'image-format.js'));
+const renderImage = require(path.join(__dirname, 'render-image.js'));
 
 const IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'];
 const IMAGE_EXT_SET = new Set(IMAGE_EXT.map(e => e.toLowerCase()));
@@ -828,34 +829,182 @@ async function getAllDimensions(filePath) {
     return getImageDimensions(filePath, indices);
 }
 
-// ── Image pipeline ───────────────────────────────────────────────────────
+// ── Render worker pool ───────────────────────────────────────────────────
 
 /**
- * @napi-rs/image, resolved lazily and cached.
+ * How many worker threads share the resize work.
  *
- * Lazy because the thumbnail path never resizes anything, and loading a ~24MB
- * native addon during a library import that only needs first-page bytes is
- * wasted work. Cached because require() cost adds up across pages.
+ * Two rather than one so a page that becomes urgent is not stuck behind a
+ * background page already being decoded; not more than two because each worker
+ * loads its own copy of the ~24MB image addon and holds a full decoded frame
+ * while it works, and the reader only ever needs a handful of pages ready at
+ * once.
  */
-let _imageLib;
-function requireImageLib() {
-    if (_imageLib === undefined) {
-        _imageLib = require(path.join(PLUGIN_ROOT, 'node_modules', '@napi-rs', 'image'));
+const RENDER_WORKERS = 2;
+
+/** Tear the pool down after this long with nothing to do, to give the memory back. */
+const WORKER_IDLE_MS = 2 * 60 * 1000;
+
+/**
+ * The pool, or null if it has not been started. `_poolUnavailable` latches when
+ * worker threads turn out not to work in this host, so we stop retrying and
+ * every call takes the in-process path instead.
+ */
+let _pool = null;
+let _poolUnavailable = false;
+let _jobSeq = 0;
+
+/**
+ * Start the pool, or return null if worker threads are not usable here.
+ *
+ * Eagle plugins run inside an Electron renderer, and whether `worker_threads`
+ * is available there depends on the Electron build. Rather than assume, we try,
+ * and on any failure — at spawn or later at runtime — fall back to rendering
+ * in-process, which is what this module did before and is still correct, just
+ * slower. Nothing else in the module needs to know which path was taken.
+ */
+function getRenderPool() {
+    if (_poolUnavailable) return null;
+    if (_pool) return _pool;
+
+    try {
+        const { Worker } = require('worker_threads');
+        const workerPath = path.join(__dirname, 'render-worker.js');
+        const pool = { workers: [], idleTimer: null };
+
+        for (let i = 0; i < RENDER_WORKERS; i++) {
+            const worker = new Worker(workerPath);
+            const entry = { worker, inFlight: new Map() };
+
+            worker.on('message', msg => {
+                const job = entry.inFlight.get(msg.id);
+                if (!job) return;
+                entry.inFlight.delete(msg.id);
+                refWorker(entry);
+                job.resolve(msg);
+            });
+            // A worker that errors or exits unexpectedly takes the whole pool
+            // with it: the failure is far more likely to be "this host cannot
+            // run workers" than a one-off, and the fallback path is always
+            // available. In-flight jobs reject and their callers retry inline.
+            worker.on('error', err => disableRenderPool(err));
+            worker.on('exit', code => {
+                if (code !== 0) disableRenderPool(new Error('render worker exited with code ' + code));
+            });
+            // An idle worker must not hold the process open. It is ref'd again
+            // for as long as it has a job (see refWorker), because a render in
+            // flight is exactly the kind of pending work that *should* keep the
+            // event loop alive — without that, a host with nothing else to do
+            // can exit between posting a job and receiving its answer.
+            worker.unref();
+
+            pool.workers.push(entry);
+        }
+
+        _pool = pool;
+        return _pool;
+    } catch (err) {
+        console.warn('[archive-util] render worker unavailable, resizing in-process:',
+            err && err.message);
+        _poolUnavailable = true;
+        _pool = null;
+        return null;
     }
-    return _imageLib;
 }
 
 /**
- * Lanczos3 in the FastResizeFilter enum. The binding is built with
- * `--no-const-enum` so the enum object exists at runtime, but pinning the
- * numeric value as a fallback means a change in how the enum is emitted
- * degrades to "still resizes correctly" rather than throwing on every page.
+ * Keep a worker ref'd exactly while it is busy.
+ *
+ * A worker holding no jobs should not keep the process alive; one that is
+ * mid-render should, or the answer can be lost to an exit that happens between
+ * posting the job and receiving the reply.
  */
-const FAST_RESIZE_LANCZOS3 = 5;
-function lanczos3(lib) {
-    const e = lib && lib.FastResizeFilter;
-    return (e && typeof e.Lanczos3 === 'number') ? e.Lanczos3 : FAST_RESIZE_LANCZOS3;
+function refWorker(entry) {
+    if (entry.inFlight.size > 0) entry.worker.ref();
+    else entry.worker.unref();
 }
+
+/** Reject everything outstanding and stop using workers for the rest of the session. */
+function disableRenderPool(err) {
+    if (err) {
+        console.warn('[archive-util] render worker failed, resizing in-process from now on:',
+            err && err.message);
+    }
+    _poolUnavailable = true;
+    const pool = _pool;
+    _pool = null;
+    if (!pool) return;
+    clearTimeout(pool.idleTimer);
+    for (const entry of pool.workers) {
+        for (const job of entry.inFlight.values()) job.reject(err || new Error('render pool shut down'));
+        entry.inFlight.clear();
+        try { entry.worker.terminate(); } catch (_) { }
+    }
+}
+
+/** Shut the pool down cleanly. Unlike disableRenderPool, a later call may restart it. */
+function stopRenderPool() {
+    const pool = _pool;
+    _pool = null;
+    if (!pool) return;
+    clearTimeout(pool.idleTimer);
+    for (const entry of pool.workers) {
+        for (const job of entry.inFlight.values()) job.reject(new Error('render pool stopped'));
+        entry.inFlight.clear();
+        try { entry.worker.terminate(); } catch (_) { }
+    }
+}
+
+/** Restart the idle countdown; fires only once every worker is free. */
+function scheduleRenderPoolIdle(pool) {
+    clearTimeout(pool.idleTimer);
+    pool.idleTimer = setTimeout(() => {
+        if (_pool !== pool) return;
+        if (pool.workers.some(e => e.inFlight.size > 0)) {
+            scheduleRenderPoolIdle(pool);
+            return;
+        }
+        stopRenderPool();
+    }, WORKER_IDLE_MS);
+    if (pool.idleTimer && typeof pool.idleTimer.unref === 'function') pool.idleTimer.unref();
+}
+
+/**
+ * Run one render job on the pool.
+ *
+ * Dispatch goes to the least loaded worker rather than round-robin, so a worker
+ * that happens to be chewing on a large page does not collect a queue behind it
+ * while its sibling sits idle.
+ *
+ * @returns {Promise<object|null>} the worker's reply, or null if there is no
+ *   usable pool — in which case the caller should render in-process.
+ */
+function renderOnPool(job) {
+    const pool = getRenderPool();
+    if (!pool) return Promise.resolve(null);
+
+    let target = pool.workers[0];
+    for (const entry of pool.workers) {
+        if (entry.inFlight.size < target.inFlight.size) target = entry;
+    }
+
+    const id = ++_jobSeq;
+    return new Promise((resolve, reject) => {
+        target.inFlight.set(id, { resolve, reject });
+        refWorker(target);
+        try {
+            target.worker.postMessage({ ...job, id });
+        } catch (err) {
+            target.inFlight.delete(id);
+            refWorker(target);
+            reject(err);
+            return;
+        }
+        scheduleRenderPoolIdle(pool);
+    });
+}
+
+// ── Image pipeline ───────────────────────────────────────────────────────
 
 /**
  * Detected container for a page, cached on the session.
@@ -901,43 +1050,25 @@ function rememberScaled(session, cacheKey, outPath, index) {
 }
 
 /**
- * Pick the output encoder for a page.
- *
- * The rule is "same format out as in", so a page never changes character just
- * because it was resized — with one exception. @napi-rs/image decodes GIF but
- * cannot encode it, so a static GIF is re-encoded as PNG: both are lossless,
- * and a GIF page here is single-frame by definition (animated ones never reach
- * this code).
- *
- * @param {string} format - detected container, from image-format.js
- * @returns {{ext: string, encode: (t: any) => Promise<Buffer>}}
- */
-function encoderFor(format) {
-    switch (format) {
-        case 'png':
-            // CompressionType.Fast — this is a display cache, not an archive;
-            // spending CPU on a smaller temp file is a bad trade.
-            return { ext: '.png', encode: t => t.png({ compressionType: 1 }) };
-        case 'webp':
-            return { ext: '.webp', encode: t => t.webp(90) };
-        case 'gif':
-            return { ext: '.png', encode: t => t.png({ compressionType: 1 }) };
-        case 'avif':
-            // Encoding AVIF is far too slow for an interactive path (seconds per
-            // page); JPEG keeps the resize worth doing at all.
-            return { ext: '.jpg', encode: t => t.jpeg(90) };
-        default:
-            return { ext: '.jpg', encode: t => t.jpeg(90) };
-    }
-}
-
-/**
  * Render a single page at a specific pixel width.
  *
  * Backed by @napi-rs/image: prebuilt Rust/N-API binaries, so there is no
- * node-gyp step and one build works across Node and Electron versions. The
- * encoders run on the libuv threadpool, which keeps the decode/resize off the
- * renderer's main thread — hence the async-only API here.
+ * node-gyp step and one build works across Node and Electron versions.
+ *
+ * The work runs on a worker thread. That is not an optimisation so much as a
+ * correction: this module is required directly into Eagle's renderer process,
+ * and unlike Sharp — which did everything on the libuv pool — @napi-rs/image
+ * performs the resize inline on the calling thread. Left in place, every page
+ * turn blocked the thread that paints for as long as a decode and a scale took,
+ * which is what a reader flicking through pages sees as a blank page. If worker
+ * threads are not available in this host the same code runs in-process instead;
+ * see getRenderPool().
+ *
+ * Three things are settled before any file is touched, in increasing cost:
+ * the on-disk cache, whether the page is animated (a header read), and whether
+ * the requested width is close enough to native to make resizing pointless.
+ * The last of those uses the dimensions image-size already cached for layout,
+ * so the common "no resize needed" answer costs nothing at all.
  *
  * @param {string} filePath - Absolute path to the CBZ/CBR archive
  * @param {number} index - 0-based image index
@@ -969,47 +1100,66 @@ async function renderAtScale(filePath, index, targetPixelWidth) {
         // a single frame. Cached per page, so the header read happens once.
         if (isAnimatedPage(session, index, originalPath)) return originalPath;
 
-        const lib = requireImageLib();
-        const bytes = fs.readFileSync(originalPath);
-        const transformer = new lib.Transformer(bytes);
+        // Dimensions from image-size: a file-header read, cached on the session,
+        // and in practice already done — the viewer asks for the dimensions of
+        // every preloaded page before it ever asks for a render. Asking the
+        // addon instead, as this used to, cost a decode per page purely to learn
+        // a number we were already holding.
+        const known = getImageDimensions(normPath, [index])[0];
+        const srcWidth = (known && known.width) || 0;
+        const srcHeight = (known && known.height) || 0;
 
-        const meta = await transformer.metadata(false);
-        if (!meta || !meta.width || !meta.height) return null;
-
-        // Target width capped at original (no upscale)
-        const targetW = Math.min(targetPixelWidth, meta.width);
-
-        // Within 95% of native, serve the original: re-encoding would cost time
-        // and add a generation of loss for no visible gain. This is the common
-        // case at high zoom, where the original is exactly what should be shown.
-        if (targetW >= meta.width * 0.95 && meta.width <= 10000 && meta.height <= 10000) {
+        // The early exit, now reached without reading the file. This is the
+        // common case at high zoom, where the original is exactly what should
+        // be shown.
+        if (srcWidth > 0 && srcHeight > 0 &&
+            renderImage.isNativeEnough(targetPixelWidth, srcWidth, srcHeight)) {
             return originalPath;
         }
 
         const format = detectPageFormat(session, index, originalPath) || 'jpeg';
-        const { ext, encode } = encoderFor(format);
+        const { ext, encoder, quality } = renderImage.encoderFor(format);
         // cacheKey is built from a number, but route it through the same check
         // as archive entries so every write in this module has one gatekeeper.
         const outPath = resolveInside(session.tmpDir, cacheKey + ext);
         if (!outPath) return null;
 
-        // fastResize is the SIMD path; Lanczos3 matches the quality of the
-        // previous libvips output closely enough to be indistinguishable on
-        // comic scans. Height is derived from the aspect ratio.
-        const targetH = Math.max(1, Math.round(meta.height * (targetW / meta.width)));
-        transformer.fastResize({
-            width: targetW,
-            height: targetH,
-            filter: lanczos3(lib),
-        });
+        const job = {
+            srcPath: originalPath,
+            outPath,
+            targetPixelWidth,
+            encoder,
+            quality,
+            srcWidth,
+            srcHeight,
+        };
 
-        const out = await encode(transformer);
-        if (!out || !out.length) return null;
+        let result = null;
+        try {
+            const reply = await renderOnPool(job);
+            if (reply && !reply.ok) throw new Error(reply.error);
+            result = reply;
+        } catch (err) {
+            // Either this one page defeated the worker, or worker threads are
+            // not usable at all. Both are handled the same way: fall through to
+            // the in-process path, which is slower but not wrong. Only the
+            // second case latches (via disableRenderPool, from the worker's
+            // 'error'/'exit' handlers), so a single bad page does not cost every
+            // later page a pointless round-trip.
+            console.warn('[archive-util] worker render failed for page ' + index +
+                ', retrying in-process:', err && err.message);
+            result = null;
+        }
 
-        // The session can be torn down while the threadpool is working
+        if (!result) result = await renderImage.renderToFile(job);
+
+        // The addon's own metadata disagreed with image-size, or none was
+        // available: the page turned out not to need resizing after all.
+        if (result.skipped) return originalPath;
+
+        // The session can be torn down while the worker is working
         if (session.destroyed) return null;
 
-        fs.writeFileSync(outPath, out);
         rememberScaled(session, cacheKey, outPath, index);
         return outPath;
     } catch (err) {
@@ -1055,12 +1205,16 @@ function cleanup(filePath, expectedToken) {
 
 /**
  * Clean up all sessions.
+ *
+ * Also stops the render workers: with no session left there is nothing they
+ * could be asked to resize, and they are cheap to start again if one reopens.
  */
 function cleanupAll() {
     for (const session of sessions.values()) {
         session.destroy();
     }
     sessions.clear();
+    stopRenderPool();
 }
 
 // Cleanup on process exit

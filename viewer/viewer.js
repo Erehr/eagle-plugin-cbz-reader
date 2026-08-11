@@ -329,20 +329,103 @@
     let renderEpoch = 0;
     let preloadTimer = 0;
 
+    /**
+     * How many render tasks may be in flight at once.
+     *
+     * The point is not raw throughput — the resize itself runs on worker threads
+     * now — but latency. With a single slot, a page that becomes urgent has to
+     * wait for whatever background page happens to be running. With a few slots
+     * it starts almost immediately. Kept small because each task ends in a
+     * main-thread `decode()`, and running many of those at once janks the
+     * compositor, which is the thing we are trying to avoid.
+     */
+    const RENDER_CONCURRENCY = 3;
+
+    /**
+     * Rank bands. A task's effective priority is its rank minus how far its page
+     * sits from the centre of the view, so pages are ordered first by why they
+     * were asked for and only then by distance. Bands are spaced far enough
+     * apart that distance can never promote a page across one.
+     */
+    const RANK_CURRENT = 3000;    // the spread being looked at, and the two after it
+    const RANK_VISIBLE = 2000;    // scrolled into view, requested by the intersection observer
+    const RANK_ADJACENT = 1000;   // the spreads either side
+    const RANK_BACKGROUND = 100;  // the rest of the preload window
+
     /** Asynchronous render queue to prevent main-thread blocking during parallel image decodes */
     const renderQueue = {
         tasks: [],
-        running: false,
-        add: function (priority, idx, taskFn, epoch) {
-            if (this.tasks.some(t => t.idx === idx)) return;
-            this.tasks.push({ priority, idx, taskFn, epoch: epoch !== undefined ? epoch : renderEpoch });
-            this.tasks.sort((a, b) => b.priority - a.priority);
+        /** Number of tasks currently in flight (0..RENDER_CONCURRENCY) */
+        running: 0,
+        /**
+         * Queue a render for `idx`, or raise the rank of one already queued.
+         *
+         * Raising rather than dropping is the important half. A page is first
+         * queued as distant background work, and can then become the page the
+         * user is actually looking at a moment later. Ignoring the second,
+         * higher-ranked request — which is what this used to do — left that page
+         * pinned at the back of the queue behind everything scheduled for the
+         * position the reader had already left, so a fast flick landed on a
+         * blank page and waited for several unrelated renders to finish first.
+         *
+         * The task function is replaced along with the rank: the newer closure
+         * holds the newer file path, which matters if the old one was purged
+         * from the temp directory in the meantime.
+         *
+         * `rank` is a band from the constants above, not a final score. Keeping
+         * the two separate is what lets reprioritize() re-sort the queue around
+         * a new centre later without losing why each page was queued.
+         */
+        add: function (rank, idx, taskFn, epoch) {
+            const taskEpoch = epoch !== undefined ? epoch : renderEpoch;
+            const center = getCurrentCenterImageIndex();
+            const existing = this.tasks.find(t => t.idx === idx);
+            if (existing) {
+                if (rank > existing.rank) {
+                    existing.rank = rank;
+                    existing.taskFn = taskFn;
+                    // Also adopt the newer epoch, or process() would discard the
+                    // task as stale the moment it reached the front.
+                    existing.epoch = taskEpoch;
+                    this.rescore(center);
+                }
+                this.process();
+                return;
+            }
+            this.tasks.push({ rank, idx, taskFn, epoch: taskEpoch, priority: 0 });
+            this.rescore(center);
             this.process();
         },
-        process: async function () {
-            if (this.running || this.tasks.length === 0) return;
-            this.running = true;
-            const task = this.tasks.shift();
+        /** Score every pending task against `center` and put the queue in order. */
+        rescore: function (center) {
+            for (const t of this.tasks) t.priority = t.rank - Math.abs(t.idx - center);
+            this.tasks.sort((a, b) => b.priority - a.priority);
+        },
+        /**
+         * Re-order pending work around a new centre page.
+         *
+         * Scores are relative to wherever the reader was when each task was
+         * queued, so after a burst of page turns the whole queue is ordered for
+         * a page the user has already passed. Re-scoring is pure arithmetic — no
+         * IO, no async — so it is cheap enough to run on every navigation event,
+         * and unlike a flush it keeps preload work that is still useful.
+         *
+         * Ranks are left alone, so a background page never gets promoted above
+         * the spread on screen just by being close to it.
+         *
+         * Tasks already in flight are not affected; they finish on their own.
+         */
+        reprioritize: function (center) {
+            if (this.tasks.length < 2) return;
+            this.rescore(center);
+        },
+        process: function () {
+            while (this.running < RENDER_CONCURRENCY && this.tasks.length > 0) {
+                this.running++;
+                this.runTask(this.tasks.shift());
+            }
+        },
+        runTask: async function (task) {
             try {
                 /* Skip stale tasks from a previous navigation epoch */
                 if (task.epoch === renderEpoch) {
@@ -351,8 +434,11 @@
                     };
                     await task.taskFn(abortToken);
                 }
+            } catch (err) {
+                // A task that throws must not wedge the slot it occupies.
+                console.error('Render task failed for page ' + task.idx + ':', err);
             } finally {
-                this.running = false;
+                this.running--;
                 this.process();
             }
         },
@@ -662,8 +748,9 @@
                 if (img && !needsLoad(img)) continue;
                 const idx = parseInt(mediaEl.dataset.index, 10);
                 if (isNaN(idx)) continue;
-                const dist = Math.abs(idx - getCurrentCenterImageIndex());
-                renderQueue.add(2000 - dist, idx, async (abortToken) => {
+                // The queue applies the distance term itself, against whatever
+                // the centre is at the time — including after a reprioritize.
+                renderQueue.add(RANK_VISIBLE, idx, async (abortToken) => {
                     const taskEpoch = renderEpoch;
                     // Abort if user fast-scrolled far away before this task started
                     const currentDist = Math.abs(idx - getCurrentCenterImageIndex());
@@ -1119,6 +1206,13 @@
 
     let onScrollBlock = false;
     let scrollPreloadTimer = 0;
+
+    /**
+     * Page jump in continuous mode beyond which queued render work is discarded
+     * rather than reordered. Anything within this distance is still inside — or
+     * just outside — the preload window, so it is worth keeping.
+     */
+    const SCROLL_FLUSH_PAGES = 5;
     function onScroll() {
         if (!continuous || onScrollBlock) return;
         const content = readingContainer;
@@ -1159,12 +1253,25 @@
         }
         const newIndex = pagesPerView === 2 ? getSpreadForImage(imageNames.length, selKey1) + 1 : selKey1 + 1;
         if (newIndex !== currentIndex) {
-            // Clear stale render tasks when user scrolls to a new page
-            // so viewport-local images get priority
-            renderQueue.clear();
-            renderEpoch++;
-
+            const jumped = Math.abs(newIndex - currentIndex) > SCROLL_FLUSH_PAGES;
             currentIndex = newIndex;
+
+            if (jumped) {
+                // A scrubber drag or a wheel spin that covered real distance:
+                // everything queued is for pages nowhere near the viewport, so
+                // throwing it away is right.
+                renderQueue.clear();
+                renderEpoch++;
+            } else {
+                // Ordinary scrolling across a page boundary. Flushing here — as
+                // this used to — aborted the in-flight render every time the
+                // reader crossed into a new page, so during a continuous scroll
+                // nothing ever got the chance to finish. Reordering gives the
+                // viewport-local pages their priority without discarding work
+                // that is about to be needed anyway.
+                renderQueue.reprioritize(getCurrentCenterImageIndex());
+            }
+
             updatePageInfo();
             preloadImagesAroundCurrent();
             syncVideoPlayback();
@@ -1306,15 +1413,16 @@
                 continue;
             }
 
-            const dist = Math.abs(idx - center);
-            let taskPriority = priority ? (1000 - dist) : (100 - dist);
+            // Rank only — the queue applies the distance term itself, so this
+            // stays correct after the reader moves and the queue is re-scored.
+            let taskRank = priority ? RANK_ADJACENT : RANK_BACKGROUND;
             if (idx === center || (priority && idx > center && idx <= center + 2)) {
-                taskPriority += 2000;
+                taskRank = RANK_CURRENT;
             }
 
             const isVid = mediaEl.tagName === 'VIDEO';
 
-            renderQueue.add(taskPriority, idx, async (abortToken) => {
+            renderQueue.add(taskRank, idx, async (abortToken) => {
                 const taskEpoch = renderEpoch;
 
                 if (isVid) {
@@ -1442,6 +1550,15 @@
         updateNav();
         savePosition();
         syncVideoPlayback();
+
+        /* Re-order what is already queued for where we just landed.
+           This has to happen now rather than in the debounced preload pass below:
+           a burst of single-page turns never trips the flush threshold above, so
+           without it the page now on screen stays behind everything that was
+           queued for the page we started from — several renders' worth of wait
+           on a fast flick. Reordering is free, and unlike a flush it keeps the
+           preload work that is still useful. */
+        renderQueue.reprioritize(getCurrentCenterImageIndex());
 
         /* Debounce preloading: only fire 200ms after the last navigation event.
            During rapid key-holds this means work is queued only once the user stops. */
