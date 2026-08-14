@@ -26,7 +26,19 @@ const PLUGIN_ROOT = path.join(__dirname, '..');
 let _imageLib;
 function requireImageLib() {
     if (_imageLib === undefined) {
-        _imageLib = require(path.join(PLUGIN_ROOT, 'node_modules', '@napi-rs', 'image'));
+        try {
+            _imageLib = require(path.join(PLUGIN_ROOT, 'node_modules', '@napi-rs', 'image'));
+        } catch (err) {
+            // No prebuilt binary for this platform/arch. Latch the failure as
+            // null rather than letting the throw escape on every page: the
+            // caller degrades to serving the original file, which is correct,
+            // just not downscaled. Retrying the require per page would only
+            // repeat the same resolution walk and the same console noise.
+            _imageLib = null;
+            console.warn('[render-image] @napi-rs/image unavailable on ' +
+                process.platform + '/' + process.arch +
+                ', serving pages at native resolution:', err && err.message);
+        }
     }
     return _imageLib;
 }
@@ -152,6 +164,10 @@ async function renderToFile(job) {
     }
 
     const lib = requireImageLib();
+    // Same contract as "close enough to native": the caller should use the
+    // original file. A platform with no prebuilt addon still reads comics.
+    if (!lib) return { skipped: true };
+
     const bytes = await fs.promises.readFile(job.srcPath);
     const transformer = new lib.Transformer(bytes);
 
