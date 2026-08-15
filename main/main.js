@@ -35,11 +35,8 @@ const RESERVED_BASENAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 /**
  * Validate the typed archive name as a *single* file basename.
  *
- * The name is joined to a temp directory to create a file, so it must not be
- * able to describe anything other than a direct child of that directory. Path
- * separators, '.'/'..' and drive-relative forms are rejected outright rather
- * than quietly rewritten, so the file that gets created is always the one whose
- * name the user can see in the input.
+ * Path separators, '.'/'..' and drive-relative forms are rejected rather than
+ * quietly rewritten, so the file created is always the one the user typed.
  *
  * @returns {{ok: true, name: string} | {ok: false, reason: string}}
  */
@@ -60,7 +57,6 @@ function validateArchiveName(input) {
 
 /**
  * Resolve `name` to an absolute path that is provably a direct child of `dir`.
- * The final gate before anything is created on disk.
  *
  * @returns {string|null}
  */
@@ -171,10 +167,8 @@ function onNameChanged() {
 }
 
 /**
- * Keep the ".cbz" suffix sitting immediately after the typed text instead of
- * floating at the far edge of the field, so it reads as part of the filename
- * rather than as a separate label. A hidden mirror span rendered in the input's
- * own font gives the exact text width.
+ * Keep the ".cbz" suffix immediately after the typed text rather than at the far
+ * edge of the field. A hidden mirror span gives the exact text width.
  */
 function syncNameSuffix() {
     if (!nameField || !nameMirror) return;
@@ -404,10 +398,8 @@ function formatSize(bytes) {
 /**
  * Confirm the destructive half of the operation before any of it starts.
  *
- * "Move originals to Trash" is opt-in and remembered between runs, which means
- * it can be on without the user thinking about it on this particular run — so
- * it is spelled out with a count, and asked *before* the archive is built so
- * cancelling leaves nothing behind to undo.
+ * "Move originals to Trash" is remembered between runs, so it is spelled out
+ * with a count and asked before the archive is built.
  */
 async function confirmTrashOriginals(archiveName, count) {
     try {
@@ -466,12 +458,6 @@ async function createCBZ() {
         } catch (_) { }
 
         // Build CBZ in a temp directory of our own.
-        //
-        // mkdtemp rather than mkdir: it returns a directory that is guaranteed
-        // not to have existed, so nothing already on disk can be reached from
-        // here. The filename is then resolved against that directory and checked
-        // to be a direct child of it before anything is created, and the stream
-        // opens with 'wx' so an existing file is reported rather than truncated.
         tmpDir = fs.mkdtempSync(path.join(eagle.os.tmpdir(), 'eagle-cbz-creator-'));
         const tmpFile = resolveInside(tmpDir, archiveName + '.cbz');
         if (!tmpFile) throw new Error('Invalid file name');
@@ -575,8 +561,7 @@ async function createCBZ() {
 
 /**
  * Flatten an Eagle item name into an entry name for inside the archive.
- * Directory separators and characters that are illegal on any supported
- * platform are replaced, so an odd item name cannot shape the zip's structure.
+ * Separators and characters illegal on any supported platform are replaced.
  */
 function sanitize(name) {
     return String(name == null ? '' : name)

@@ -1,20 +1,13 @@
 /**
  * Container header inspection — format identification and animation detection.
  *
- * Sharp answered "is this page animated?" via `metadata().pages`, but
- * @napi-rs/image exposes no frame count, so we read the container headers
- * ourselves. That turns out to be the better trade anyway: these checks touch a
- * few hundred bytes of header and never invoke a decoder, whereas the old
- * metadata() call spun up libvips for every page.
- *
- * Everything here reads from a small prefix of the file. Callers that already
- * hold the bytes can pass them straight in; `inspectFile` reads just enough from
- * disk for the answer.
+ * These checks read a few hundred bytes of header and never invoke a decoder.
+ * Callers that already hold the bytes can pass them straight in; `inspectFile`
+ * reads just enough from disk for the answer.
  */
 const fs = require('fs');
 
-/** Header bytes to read from disk. Enough for a WebP VP8X chunk, a GIF's first
- *  frames, or an AVIF ftyp box with a generous compatible-brand list. */
+/** Header bytes to read from disk. */
 const HEADER_BYTES = 4096;
 
 /** Formats that can carry more than one frame, so are worth checking. */
@@ -87,10 +80,7 @@ function isoBrands(buf) {
     return brands;
 }
 
-/**
- * Animated AVIF is signalled by the 'avis' brand (AVIF image *sequence*),
- * which appears as either the major brand or a compatible brand.
- */
+/** Animated AVIF is signalled by the 'avis' brand, major or compatible. */
 function isAnimatedAvif(buf) {
     if (buf.length < 16 || ascii(buf, 4, 4) !== 'ftyp') return false;
     return isoBrands(buf).includes('avis');
@@ -99,11 +89,11 @@ function isAnimatedAvif(buf) {
 // ── WebP ─────────────────────────────────────────────────────────────────
 
 /**
- * Animated WebP is an extended-format file: a VP8X chunk whose flags byte has
- * the ANIM bit set. A plain VP8 / VP8L file cannot be animated at all.
+ * Animated WebP: a VP8X chunk whose flags byte has the ANIM bit set. A plain
+ * VP8 / VP8L file cannot be animated at all.
  *
  * RIFF layout: 'RIFF' u32 size 'WEBP' then chunks of ['FourCC' u32 size payload].
- * VP8X, when present, is required to be the first chunk.
+ * VP8X, when present, is the first chunk.
  */
 function isAnimatedWebp(buf) {
     if (buf.length < 21) return false;
@@ -119,16 +109,10 @@ function isAnimatedWebp(buf) {
 
 /**
  * Walk the GIF block structure counting image descriptors, stopping as soon as
- * a second one is found. Counting frames is the only correct test: the
- * NETSCAPE loop extension is a common shortcut but it is neither required for
- * animation nor absent from some single-frame files.
+ * a second one is found.
  *
- * Tri-state on purpose. Unlike WebP and AVIF — whose animation markers sit at a
- * fixed offset near the start — a GIF's second frame can be anywhere, typically
- * tens of kilobytes in. Answering `false` from a truncated prefix would call a
- * real animation static and let it be resized into a single frame, so a walk
- * that runs out of bytes reports `undefined` and lets the caller decide whether
- * to re-read the whole file.
+ * Tri-state: a GIF's second frame can lie beyond the prefix, so a walk that
+ * runs out of bytes reports `undefined` rather than calling an animation static.
  *
  * @returns {boolean|undefined} undefined = inconclusive, needs more bytes
  */
@@ -203,7 +187,7 @@ function isAnimatedBuffer(buf) {
         case 'webp': return isAnimatedWebp(buf);
         case 'gif': return isAnimatedGif(buf);
         case 'avif': return isAnimatedAvif(buf);
-        default: return false; // jpeg/png/bmp/tiff cannot animate in any way we care about
+        default: return false; // jpeg/png/bmp/tiff cannot animate
     }
 }
 
@@ -225,10 +209,8 @@ function readHeader(filePath, bytes) {
 /**
  * Inspect a file on disk.
  *
- * Reads a small header first, which settles every case except a GIF whose
- * second frame lies beyond it. Only then does it fall back to reading the whole
- * file — an animated GIF page is rare in a comic archive, and being wrong there
- * means resizing an animation down to one dead frame.
+ * Reads a small header first, falling back to the whole file only for a GIF
+ * whose second frame lies beyond it.
  *
  * @returns {{format: string|null, animated: boolean}}
  */
@@ -249,8 +231,7 @@ function inspectFile(filePath) {
         } catch (_) {
             animated = undefined;
         }
-        // Still unresolved (unreadable or malformed): assume animated, because
-        // skipping a resize is cheap and flattening an animation is not.
+        // Still unresolved: assume animated, since skipping a resize is cheap.
         if (animated === undefined) animated = true;
     }
 

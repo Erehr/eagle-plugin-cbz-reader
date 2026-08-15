@@ -1,12 +1,9 @@
 /**
  * Archive helpers for CBZ (ZIP) and CBR (RAR).
  *
- * Strategy: lazy extraction to temp directory.
- *  - On first access, list all entries (opens archive once).
- *  - Extract images on-demand in a window around the requested index (±PRELOAD_AHEAD).
- *  - Purge extracted files beyond ±PURGE_DISTANCE to save disk space.
- *  - Return file paths (not buffers) so the renderer can use file:// URLs.
- *  - Provide image dimensions via image-size for virtual scroll height calculation.
+ * Lazy extraction to a temp directory: list entries once, extract images
+ * on-demand in a window around the requested index, purge files beyond
+ * ±PURGE_DISTANCE, and return file paths so the renderer can use file:// URLs.
  */
 const path = require('path');
 const fs = require('fs');
@@ -37,11 +34,9 @@ const PURGE_STEP = 25;
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /**
- * Junk entries that macOS adds when creating a zip:
- *  - everything under __MACOSX/
- *  - AppleDouble resource forks, which are siblings named ._page001.jpg. These
- *    keep the original extension, so an extension check alone lets them through
- *    and you get a duplicate unreadable "page" next to every real one.
+ * Junk entries macOS adds when creating a zip: everything under __MACOSX/, and
+ * AppleDouble resource forks (siblings named ._page001.jpg, which keep the
+ * original extension so an extension check alone lets them through).
  */
 function isMacResourceFork(name) {
     if (name.includes('__MACOSX')) return true;
@@ -71,20 +66,15 @@ const MAX_SAFE_STEM = 64;
 
 /**
  * Extensions we are willing to put on a file we create in the temp directory.
- * An entry name inside an archive is attacker-controlled, so the extension is
- * taken from an allowlist rather than from the entry itself.
+ * Taken from an allowlist rather than from the entry name.
  */
 const SAFE_EXT_SET = new Set(MEDIA_EXT.map(e => e.toLowerCase()));
 
 /**
  * Build a flat, filesystem-safe basename for an archive entry.
  *
- * Entry names are untrusted input: they can carry directory components, '..'
- * segments, drive letters, NTFS stream separators or control characters, any
- * of which can make a write land outside the session temp directory. So the
- * entry name is never used as a path here — it only contributes a cosmetic
- * suffix. `index` is what actually makes the result unique, which means
- * collisions are impossible by construction rather than by checking for them.
+ * The entry name only contributes a cosmetic suffix; `index` is what makes the
+ * result unique, so collisions are impossible by construction.
  *
  * @param {string} entryName - path of the entry inside the archive
  * @param {number} index - position of the entry in the session's sorted list
@@ -109,10 +99,6 @@ function safeEntryFileName(entryName, index) {
 /**
  * Resolve `name` to an absolute path directly inside `dir`, or return null.
  *
- * Belt and braces on top of safeEntryFileName: even a name that already looks
- * flat is re-checked after resolution, so anything that would escape the
- * directory — or land in a subdirectory of it — is rejected instead of written.
- *
  * @returns {string|null} absolute path, guaranteed to be an immediate child of `dir`
  */
 function resolveInside(dir, name) {
@@ -129,7 +115,7 @@ function resolveInside(dir, name) {
 // ── Per-Archive Session ──────────────────────────────────────────────────
 
 /**
- * Cache of open archive sessions:  archivePath → ArchiveSession
+ * Cache of open archive sessions: archivePath → ArchiveSession.
  * Each session holds the temp dir, sorted entry list, and extraction state.
  */
 const sessions = new Map();
@@ -147,16 +133,15 @@ class ArchiveSession {
         this.entryMap = entryMap || new Map();
         /**
          * Unique identity for this session. A viewer captures it on open and passes
-         * it back to cleanup(), so a slow-closing viewer can never tear down the
-         * session that a newly opened viewer already created for the same archive.
+         * it back to cleanup(), so a slow-closing viewer cannot tear down a session
+         * a newly opened viewer already created.
          */
         this.token = 'sess_' + (++_sessionSeq) + '_' + Date.now();
         /** Sorted list of entry names (inside-archive paths) */
         this.imageEntries = imageEntries;
         /**
          * entryName → flat on-disk basename, precomputed from the sorted entry
-         * list. Every extraction target comes from here, so no untrusted string
-         * from an archive ever reaches path.join, and two entries can never
+         * list. Every extraction target comes from here, so two entries can never
          * resolve to the same file.
          */
         this.safeNames = new Map(imageEntries.map((n, i) => [n, safeEntryFileName(n, i)]));
@@ -172,9 +157,8 @@ class ArchiveSession {
         this._lastPurgeCenter = null;
         /**
          * Map<index, string|null> – detected container per page, and
-         * Map<index, boolean> – whether that page is an animated image.
-         * Both come from one header read and are keyed by page, not by file, so
-         * they survive the extracted file being purged and re-extracted.
+         * Map<index, boolean> – whether that page is an animated image. Keyed by
+         * page, so they survive a file being purged and re-extracted.
          */
         this.formats = new Map();
         this.animated = new Map();
@@ -194,12 +178,9 @@ class ArchiveSession {
     /**
      * Flat on-disk basename for an entry.
      *
-     * Precomputed for every entry we listed. Anything else — a sibling that
-     * unrar decides to unpack while resolving a solid block, say — gets a name
-     * assigned here on the spot, so it still lands somewhere harmless inside
-     * the temp directory instead of wherever the archive asked for. Indices for
-     * these start past the end of the entry list, so they cannot collide with a
-     * real page.
+     * Precomputed for every entry we listed. Anything else gets a name assigned
+     * here on the spot, with an index past the end of the entry list so it
+     * cannot collide with a real page.
      */
     diskNameFor(entryName) {
         let name = this.safeNames.get(entryName);
@@ -211,9 +192,9 @@ class ArchiveSession {
     }
 
     /**
-     * Absolute path to write an entry to, verified to sit directly inside this
-     * session's temp directory. Returns null only if the name somehow still
-     * fails the containment check, in which case callers skip the entry.
+     * Absolute path to write an entry to, inside this session's temp directory.
+     * Returns null if the name fails the containment check, in which case
+     * callers skip the entry.
      */
     targetPathFor(entryName) {
         return resolveInside(this.tmpDir, this.diskNameFor(entryName));
@@ -245,11 +226,9 @@ class ArchiveSession {
     /**
      * Run `fn` with exclusive access to this archive.
      *
-     * Important: the chain is joined *synchronously*, so callers must not await
-     * anything between deciding to queue work and calling this. Otherwise two
-     * operations can both observe the same "previous" link and interleave — which
-     * is how a page removal could close the archive handle out from under an
-     * extraction batch that was supposed to run first.
+     * The chain is joined *synchronously*, so callers must not await anything
+     * between deciding to queue work and calling this, or two operations can
+     * both observe the same previous link and interleave.
      */
     runExclusive(fn) {
         const p = this._extractionChain.then(fn, fn);
@@ -257,10 +236,7 @@ class ArchiveSession {
         return p;
     }
 
-    /**
-     * Re-open the archive handle if it was released (or was never opened).
-     * Keeps extraction working after a close without callers having to care.
-     */
+    /** Re-open the archive handle if it was released, or was never opened. */
     async ensureArchive() {
         if (this.destroyed) return null;
         if (this.zip) return this.zip;
@@ -302,11 +278,8 @@ class ArchiveSession {
  * Open the zip once and keep the handle. Returns the media entry names (sorted)
  * plus the live ZipFile and a name→Entry map.
  *
- * Holding the handle is what makes extraction cheap: yauzl with lazyEntries has
- * to walk the central directory from the start on every open, so re-opening for
- * each preload batch was O(entries) work per batch — very noticeable on long
- * archives once you are deep into them. With the Entry objects cached we can
- * seek straight to the local header of any page.
+ * Holding the handle keeps extraction cheap: yauzl with lazyEntries walks the
+ * central directory on every open, so re-opening per batch was O(entries).
  */
 function listEntriesCBZ(src) {
     return new Promise((resolve, reject) => {
@@ -359,8 +332,8 @@ function extractOneCBZ(zipfile, entry, session) {
 
 /**
  * Extract the requested entries from an open session, several at a time.
- * fd-slicer supports concurrent read streams on one descriptor, so this
- * overlaps inflate (CPU) with disk writes (IO) instead of strictly serialising.
+ * fd-slicer supports concurrent read streams on one descriptor, so inflate
+ * overlaps with disk writes instead of strictly serialising.
  */
 async function extractBatchCBZ(session, targetNames) {
     const results = new Map(); // entryName → filePath
@@ -410,17 +383,9 @@ async function listEntriesCBR(src) {
 /**
  * Extract the requested entries from a CBR into the session temp directory.
  *
- * `filenameTransform` is what makes this safe. node-unrar-js builds each output
- * path as `path.join(targetPath, filenameTransform(entryName))`, and with the
- * default identity transform an entry named '../../x.jpg' — or an absolute path
- * — is written wherever it asks, outside the directory we meant to confine it
- * to. Worse, the code that later reads, re-renders or unlinks that file would
- * follow it straight out of the temp directory.
- *
- * Mapping every entry through `diskNameFor` means the transform can only ever
- * return a flat basename we generated, so the join has nothing to escape with.
- * The same mapping is used to find the file again afterwards, so the two can
- * never disagree.
+ * Every entry is mapped through `diskNameFor`, so `filenameTransform` can only
+ * return a flat basename we generated. The same mapping finds the file again
+ * afterwards, so the two cannot disagree.
  */
 async function extractBatchCBR(src, session, targetNames) {
     const unrar = requireUnrar();
@@ -479,10 +444,8 @@ const MAX_SESSIONS = 8;
 const SESSION_IDLE_MS = 60 * 1000;
 
 /**
- * Drop the least-recently-used idle sessions if too many are open.
- * An active viewer touches its session on every preload, so it is never a
- * candidate; this only reclaims things like batch thumbnail generation that
- * forgot to clean up.
+ * Drop the least-recently-used idle sessions if too many are open. An active
+ * viewer touches its session on every preload, so it is never a candidate.
  */
 function reapIdleSessions() {
     if (sessions.size <= MAX_SESSIONS) return;
@@ -544,9 +507,8 @@ async function getSession(archivePath) {
 }
 
 /**
- * Open (or reuse) a session and return its identity token.
- * Callers should hold on to this and pass it to cleanup() so they only ever
- * tear down the session they actually opened.
+ * Open (or reuse) a session and return its identity token. Callers pass it to
+ * cleanup() so they only tear down the session they actually opened.
  */
 async function getSessionToken(filePath) {
     const session = await getSession(filePath);
@@ -695,10 +657,8 @@ async function getImageBufferByIndex(filePath, index) {
 /**
  * Extract the first frame of a video as a JPEG buffer.
  *
- * The ffmpeg binary is supplied by Eagle's FFmpeg dependency module rather than
- * bundled: `ffmpeg-static` ships a single ~80MB platform-specific executable, so
- * bundling it would have made the plugin Windows-only (and huge). Eagle installs
- * the right binary for the user's platform on demand.
+ * The ffmpeg binary comes from Eagle's FFmpeg dependency module rather than
+ * being bundled, which keeps the plugin small and cross-platform.
  *
  * @param {string} videoPath - Absolute path to the extracted video file
  * @param {string} ffmpegBin - Absolute path to the ffmpeg executable
@@ -747,8 +707,7 @@ function getVideoFrameBuffer(videoPath, ffmpegBin) {
  *
  * @param {string} filePath - archive path
  * @param {object} [opts]
- * @param {string} [opts.ffmpegPath] - ffmpeg executable from Eagle's FFmpeg module.
- *   When absent, video-first archives simply fall back to their first still image.
+ * @param {string} [opts.ffmpegPath] - ffmpeg executable from Eagle's FFmpeg module
  */
 async function getFirstImageBuffer(filePath, opts) {
     const names = await listImages(filePath);
@@ -834,11 +793,8 @@ async function getAllDimensions(filePath) {
 /**
  * How many worker threads share the resize work.
  *
- * Two rather than one so a page that becomes urgent is not stuck behind a
- * background page already being decoded; not more than two because each worker
- * loads its own copy of the ~24MB image addon and holds a full decoded frame
- * while it works, and the reader only ever needs a handful of pages ready at
- * once.
+ * Two: enough that an urgent page is not stuck behind a background one, but no
+ * more, since each worker loads its own copy of the ~24MB image addon.
  */
 const RENDER_WORKERS = 2;
 
@@ -847,8 +803,7 @@ const WORKER_IDLE_MS = 2 * 60 * 1000;
 
 /**
  * The pool, or null if it has not been started. `_poolUnavailable` latches when
- * worker threads turn out not to work in this host, so we stop retrying and
- * every call takes the in-process path instead.
+ * worker threads turn out not to work in this host.
  */
 let _pool = null;
 let _poolUnavailable = false;
@@ -857,11 +812,8 @@ let _jobSeq = 0;
 /**
  * Start the pool, or return null if worker threads are not usable here.
  *
- * Eagle plugins run inside an Electron renderer, and whether `worker_threads`
- * is available there depends on the Electron build. Rather than assume, we try,
- * and on any failure — at spawn or later at runtime — fall back to rendering
- * in-process, which is what this module did before and is still correct, just
- * slower. Nothing else in the module needs to know which path was taken.
+ * Whether `worker_threads` works in an Electron renderer depends on the build,
+ * so we try, and on failure fall back to rendering in-process.
  */
 function getRenderPool() {
     if (_poolUnavailable) return null;
@@ -883,19 +835,15 @@ function getRenderPool() {
                 refWorker(entry);
                 job.resolve(msg);
             });
-            // A worker that errors or exits unexpectedly takes the whole pool
-            // with it: the failure is far more likely to be "this host cannot
-            // run workers" than a one-off, and the fallback path is always
-            // available. In-flight jobs reject and their callers retry inline.
+            // A worker that errors or exits takes the whole pool with it; the
+            // in-process fallback is always available. In-flight jobs reject and
+            // their callers retry inline.
             worker.on('error', err => disableRenderPool(err));
             worker.on('exit', code => {
                 if (code !== 0) disableRenderPool(new Error('render worker exited with code ' + code));
             });
             // An idle worker must not hold the process open. It is ref'd again
-            // for as long as it has a job (see refWorker), because a render in
-            // flight is exactly the kind of pending work that *should* keep the
-            // event loop alive — without that, a host with nothing else to do
-            // can exit between posting a job and receiving its answer.
+            // for as long as it has a job (see refWorker).
             worker.unref();
 
             pool.workers.push(entry);
@@ -912,13 +860,7 @@ function getRenderPool() {
     }
 }
 
-/**
- * Keep a worker ref'd exactly while it is busy.
- *
- * A worker holding no jobs should not keep the process alive; one that is
- * mid-render should, or the answer can be lost to an exit that happens between
- * posting the job and receiving the reply.
- */
+/** Keep a worker ref'd exactly while it is busy, so a reply cannot be lost to exit. */
 function refWorker(entry) {
     if (entry.inFlight.size > 0) entry.worker.ref();
     else entry.worker.unref();
@@ -972,9 +914,7 @@ function scheduleRenderPoolIdle(pool) {
 /**
  * Run one render job on the pool.
  *
- * Dispatch goes to the least loaded worker rather than round-robin, so a worker
- * that happens to be chewing on a large page does not collect a queue behind it
- * while its sibling sits idle.
+ * Dispatch goes to the least loaded worker rather than round-robin.
  *
  * @returns {Promise<object|null>} the worker's reply, or null if there is no
  *   usable pool — in which case the caller should render in-process.
@@ -1007,9 +947,8 @@ function renderOnPool(job) {
 // ── Image pipeline ───────────────────────────────────────────────────────
 
 /**
- * Detected container for a page, cached on the session.
- * Read from magic bytes rather than the file extension, which inside an archive
- * is whatever the packer happened to write.
+ * Detected container for a page, cached on the session. Read from magic bytes
+ * rather than the file extension.
  */
 function detectPageFormat(session, index, filePath) {
     if (session.formats.has(index)) return session.formats.get(index);
@@ -1033,9 +972,8 @@ const SCALED_CACHE_MAX = 140;
 
 /**
  * Disk cache for downscaled pages, keyed by page + render-width bucket. Widths
- * bucket to 100px so that small layout changes reuse an existing render instead
- * of producing a new one. Tying entries to their source index lets purge() drop
- * scaled copies alongside the page they came from.
+ * bucket to 100px so small layout changes reuse an existing render. Entries are
+ * tied to their source index so purge() can drop them with the page.
  */
 function rememberScaled(session, cacheKey, outPath, index) {
     if (!session._scaledCache) session._scaledCache = new Map();
@@ -1052,23 +990,15 @@ function rememberScaled(session, cacheKey, outPath, index) {
 /**
  * Render a single page at a specific pixel width.
  *
- * Backed by @napi-rs/image: prebuilt Rust/N-API binaries, so there is no
- * node-gyp step and one build works across Node and Electron versions.
+ * The work runs on a worker thread: @napi-rs/image performs the resize inline
+ * on the calling thread, and this module is required into Eagle's renderer
+ * process, so left in place every page turn would block the thread that paints.
+ * If worker threads are not available the same code runs in-process; see
+ * getRenderPool().
  *
- * The work runs on a worker thread. That is not an optimisation so much as a
- * correction: this module is required directly into Eagle's renderer process,
- * and unlike Sharp — which did everything on the libuv pool — @napi-rs/image
- * performs the resize inline on the calling thread. Left in place, every page
- * turn blocked the thread that paints for as long as a decode and a scale took,
- * which is what a reader flicking through pages sees as a blank page. If worker
- * threads are not available in this host the same code runs in-process instead;
- * see getRenderPool().
- *
- * Three things are settled before any file is touched, in increasing cost:
- * the on-disk cache, whether the page is animated (a header read), and whether
- * the requested width is close enough to native to make resizing pointless.
- * The last of those uses the dimensions image-size already cached for layout,
- * so the common "no resize needed" answer costs nothing at all.
+ * Three things are settled before any file is touched: the on-disk cache,
+ * whether the page is animated, and whether the requested width is close enough
+ * to native to make resizing pointless.
  *
  * @param {string} filePath - Absolute path to the CBZ/CBR archive
  * @param {number} index - 0-based image index
@@ -1100,11 +1030,8 @@ async function renderAtScale(filePath, index, targetPixelWidth) {
         // a single frame. Cached per page, so the header read happens once.
         if (isAnimatedPage(session, index, originalPath)) return originalPath;
 
-        // Dimensions from image-size: a file-header read, cached on the session,
-        // and in practice already done — the viewer asks for the dimensions of
-        // every preloaded page before it ever asks for a render. Asking the
-        // addon instead, as this used to, cost a decode per page purely to learn
-        // a number we were already holding.
+        // Dimensions from image-size: a header read, cached on the session and
+        // in practice already done by the viewer's layout pass.
         const known = getImageDimensions(normPath, [index])[0];
         const srcWidth = (known && known.width) || 0;
         const srcHeight = (known && known.height) || 0;
@@ -1140,12 +1067,9 @@ async function renderAtScale(filePath, index, targetPixelWidth) {
             if (reply && !reply.ok) throw new Error(reply.error);
             result = reply;
         } catch (err) {
-            // Either this one page defeated the worker, or worker threads are
-            // not usable at all. Both are handled the same way: fall through to
-            // the in-process path, which is slower but not wrong. Only the
-            // second case latches (via disableRenderPool, from the worker's
-            // 'error'/'exit' handlers), so a single bad page does not cost every
-            // later page a pointless round-trip.
+            // Either this page defeated the worker, or worker threads are not
+            // usable at all. Both fall through to the in-process path. Only the
+            // second case latches, via disableRenderPool.
             console.warn('[archive-util] worker render failed for page ' + index +
                 ', retrying in-process:', err && err.message);
             result = null;
@@ -1172,10 +1096,8 @@ async function renderAtScale(filePath, index, targetPixelWidth) {
 /**
  * Is this page an animated image (animated WebP / GIF / AVIF)?
  *
- * Determined from container headers, not a decode, and cached per page for the
- * life of the session. The viewer needs this to skip its native `decode()` call
- * — decoding an animated WebP buffers every frame into the compositor and wrecks
- * the frame rate — and to switch the page to responsive sizing.
+ * From container headers, not a decode, and cached per page. The viewer uses it
+ * to skip its native `decode()` call and to switch to responsive sizing.
  *
  * @returns {boolean} false when the page is not extracted yet or is unreadable
  */
@@ -1204,10 +1126,8 @@ function cleanup(filePath, expectedToken) {
 }
 
 /**
- * Clean up all sessions.
- *
- * Also stops the render workers: with no session left there is nothing they
- * could be asked to resize, and they are cheap to start again if one reopens.
+ * Clean up all sessions. Also stops the render workers: with no session left
+ * there is nothing they could be asked to resize.
  */
 function cleanupAll() {
     for (const session of sessions.values()) {

@@ -9,13 +9,8 @@
     const urlModule = require('url');
 
     /**
-     * Absolute path → file:// URL.
-     *
-     * Hand-rolling this ('file:///' + backslash swap) breaks in two ways:
-     *   - on macOS the path already starts with '/', so you get file:////Users/…
-     *   - any '#', '?' or '%' in a page filename truncates or corrupts the URL,
-     *     on every platform.
-     * pathToFileURL handles the separator, the leading slash and the escaping.
+     * Absolute path → file:// URL. pathToFileURL handles the separator, the
+     * macOS leading slash, and escaping '#', '?' and '%' in page filenames.
      */
     function toFileURL(absPath) {
         try {
@@ -47,14 +42,8 @@
     /**
      * ── Stale viewer guard ──────────────────────────────────────────────
      * Eagle sometimes reuses the preview host for the next archive without the
-     * page actually re-executing (window reuse / back-forward cache). When that
-     * happens this script never reruns, so the previously opened comic stays on
-     * screen even though a different file was requested — which is exactly the
-     * "it opened the previous one" symptom.
-     *
-     * We snapshot the query we booted with and reload if it ever changes, or if
-     * the page is restored from bfcache. Both checks are no-ops in the normal
-     * case, so this costs nothing when things work correctly.
+     * page re-executing, leaving the previous comic on screen. We snapshot the
+     * query we booted with and reload if it changes, or on bfcache restore.
      */
     const bootSearch = window.location.search;
     let reloadArmed = true;
@@ -186,8 +175,7 @@
 
     /**
      * Identity of the archive session this viewer opened. Passed back to cleanup()
-     * so a viewer closing late can never delete the temp files of a viewer that
-     * has already reopened the same archive.
+     * so a viewer closing late cannot delete another viewer's temp files.
      */
     let sessionToken = null;
 
@@ -257,9 +245,8 @@
     }
 
     /**
-     * Cached element lists. These are rebuilt only when the track is rebuilt, which
-     * removes a pile of querySelectorAll() calls from the navigation / scroll / preload
-     * paths — those ran on every event and walked the whole track each time.
+     * Cached element lists, rebuilt only when the track is rebuilt. Keeps
+     * querySelectorAll() out of the navigation, scroll and preload paths.
      */
     let rFlexEls = [];
     let mediaEls = [];
@@ -332,20 +319,16 @@
     /**
      * How many render tasks may be in flight at once.
      *
-     * The point is not raw throughput — the resize itself runs on worker threads
-     * now — but latency. With a single slot, a page that becomes urgent has to
-     * wait for whatever background page happens to be running. With a few slots
-     * it starts almost immediately. Kept small because each task ends in a
-     * main-thread `decode()`, and running many of those at once janks the
-     * compositor, which is the thing we are trying to avoid.
+     * About latency, not throughput: with a single slot an urgent page waits for
+     * whatever background page is running. Kept small because each task ends in
+     * a main-thread `decode()`.
      */
     const RENDER_CONCURRENCY = 3;
 
     /**
      * Rank bands. A task's effective priority is its rank minus how far its page
-     * sits from the centre of the view, so pages are ordered first by why they
-     * were asked for and only then by distance. Bands are spaced far enough
-     * apart that distance can never promote a page across one.
+     * sits from the centre of the view. Bands are spaced far enough apart that
+     * distance can never promote a page across one.
      */
     const RANK_CURRENT = 3000;    // the spread being looked at, and the two after it
     const RANK_VISIBLE = 2000;    // scrolled into view, requested by the intersection observer
@@ -360,21 +343,14 @@
         /**
          * Queue a render for `idx`, or raise the rank of one already queued.
          *
-         * Raising rather than dropping is the important half. A page is first
-         * queued as distant background work, and can then become the page the
-         * user is actually looking at a moment later. Ignoring the second,
-         * higher-ranked request — which is what this used to do — left that page
-         * pinned at the back of the queue behind everything scheduled for the
-         * position the reader had already left, so a fast flick landed on a
-         * blank page and waited for several unrelated renders to finish first.
+         * Raising rather than dropping matters: a page queued as distant
+         * background work can become the page on screen a moment later.
          *
-         * The task function is replaced along with the rank: the newer closure
-         * holds the newer file path, which matters if the old one was purged
-         * from the temp directory in the meantime.
+         * The task function is replaced along with the rank, since the newer
+         * closure holds the newer file path.
          *
-         * `rank` is a band from the constants above, not a final score. Keeping
-         * the two separate is what lets reprioritize() re-sort the queue around
-         * a new centre later without losing why each page was queued.
+         * `rank` is a band from the constants above, not a final score, so
+         * reprioritize() can re-sort around a new centre later.
          */
         add: function (rank, idx, taskFn, epoch) {
             const taskEpoch = epoch !== undefined ? epoch : renderEpoch;
@@ -405,15 +381,10 @@
          * Re-order pending work around a new centre page.
          *
          * Scores are relative to wherever the reader was when each task was
-         * queued, so after a burst of page turns the whole queue is ordered for
-         * a page the user has already passed. Re-scoring is pure arithmetic — no
-         * IO, no async — so it is cheap enough to run on every navigation event,
-         * and unlike a flush it keeps preload work that is still useful.
+         * queued. Re-scoring is pure arithmetic, so it is cheap enough to run on
+         * every navigation event, and unlike a flush it keeps useful preload work.
          *
-         * Ranks are left alone, so a background page never gets promoted above
-         * the spread on screen just by being close to it.
-         *
-         * Tasks already in flight are not affected; they finish on their own.
+         * Ranks are left alone, and tasks already in flight are not affected.
          */
         reprioritize: function (center) {
             if (this.tasks.length < 2) return;
@@ -518,10 +489,9 @@
 
     /** Set the source of a video element */
     async function smartLoadVideo(vid, absolutePath, taskEpoch) {
-        // Use dataset.loaded as the guard — NOT vid.src.
-        // Chromium resolves the .src *property* to the page base URL when the src
-        // *attribute* is an empty string (set by purgeRenderCache), making `if (vid.src)`
-        // always truthy and preventing the video from ever loading after purge.
+        // Use dataset.loaded as the guard — NOT vid.src. Chromium resolves the
+        // .src property to the page base URL when the attribute is empty, making
+        // `if (vid.src)` always truthy after a purge.
         if (vid.dataset.loaded === '1') return;
 
         const url = toFileURL(absolutePath);
@@ -586,16 +556,14 @@
     }
 
     /**
-     * Produce (or reuse) a downscaled copy of a page at `pxWidth` via Sharp.
+     * Produce (or reuse) a downscaled copy of a page at `pxWidth`.
      *
-     * archive-util's renderAtScale owns the on-disk cache (keyed by page and
-     * width bucket, bounded/evicted there). That cache is what makes revisiting
-     * a page, flipping back and forth, or toggling layout modes cheap — those
-     * paths would otherwise force a fresh Sharp resize for every visible page.
+     * archive-util's renderAtScale owns the on-disk cache, keyed by page and
+     * width bucket, which is what makes revisiting a page or toggling layout
+     * modes cheap.
      *
-     * Returns the *original* file when resizing is pointless — because the page
-     * is animated, or because the requested width is close enough to native that
-     * a re-encode would cost time and lose quality for nothing.
+     * Returns the *original* file when resizing is pointless — an animated page,
+     * or a requested width close enough to native.
      *
      * @returns {Promise<{url: string, native: boolean}|null>}
      */
@@ -613,12 +581,9 @@
     }
 
     /**
-     * In-flight render requests, keyed by page + width bucket.
-     *
-     * Without this, a single zoom gesture launches a fresh full-size resize on
-     * every settle of the debounce, so several multi-hundred-megabyte jobs
-     * for the same page run concurrently and starve each other. Collapsing them
-     * means the second caller simply awaits the first.
+     * In-flight render requests, keyed by page + width bucket. Without this, one
+     * zoom gesture launches a fresh resize on every settle of the debounce;
+     * collapsing them means the second caller awaits the first.
      */
     const renderInFlight = new Map();
 
@@ -646,19 +611,16 @@
         }
 
         let url = toFileURL(absolutePath);
-        // Read from container headers rather than a decode, and cached per page
-        // in archive-util. We need it here up front to skip the native decode()
-        // below, which on an animated WebP buffers every frame into the
-        // compositor and destroys the frame rate.
+        // From container headers rather than a decode, cached per page in
+        // archive-util. Needed up front to skip the native decode() below, which
+        // on an animated WebP buffers every frame into the compositor.
         let isAnimated = imageIndex !== undefined
             && archiveUtil.isPageAnimated(filePath, imageIndex);
 
         /**
-         * Pixel width of what actually ends up in the <img>. Recorded so a later
-         * resize can tell whether a re-render would gain anything: growing the
-         * window past this needs more pixels, everything else does not.
-         * Serving the untouched file means full native resolution, which no
-         * amount of window growth can improve on.
+         * Pixel width of what actually ends up in the <img>, so a later resize can
+         * tell whether a re-render would gain anything. The untouched file means
+         * native resolution, which window growth cannot improve on.
          */
         const nativeWidth = (imagesData[imageIndex] && imagesData[imageIndex].width) || 0;
         let renderedWidth = nativeWidth || Infinity;
@@ -915,15 +877,10 @@
     /**
      * Remember where the reader is, as a page plus a fraction into that page.
      *
-     * A whole-container fraction (scrollTop / scrollHeight) is not good enough
-     * here. Page heights in continuous mode are derived from the container
-     * width and each page's own aspect ratio, so a resize changes them by
-     * different amounts — most of all on webtoon strips, where one page can be
-     * many screens tall. Anchoring to a page and an offset within it survives
-     * that; a global fraction drifts.
-     *
-     * Offsets are in unscaled layout space, matching imagesFullPosition, so the
-     * anchor stays valid across a zoom change too.
+     * A whole-container fraction drifts: page heights in continuous mode come
+     * from the container width and each page's aspect ratio, so a resize changes
+     * them by different amounts. Offsets are in unscaled layout space, so the
+     * anchor survives a zoom change too.
      *
      * @returns {{index: number, frac: number}|null} null when not applicable
      */
@@ -1209,8 +1166,7 @@
 
     /**
      * Page jump in continuous mode beyond which queued render work is discarded
-     * rather than reordered. Anything within this distance is still inside — or
-     * just outside — the preload window, so it is worth keeping.
+     * rather than reordered. Anything closer is still near the preload window.
      */
     const SCROLL_FLUSH_PAGES = 5;
     function onScroll() {
@@ -1263,12 +1219,9 @@
                 renderQueue.clear();
                 renderEpoch++;
             } else {
-                // Ordinary scrolling across a page boundary. Flushing here — as
-                // this used to — aborted the in-flight render every time the
-                // reader crossed into a new page, so during a continuous scroll
-                // nothing ever got the chance to finish. Reordering gives the
-                // viewport-local pages their priority without discarding work
-                // that is about to be needed anyway.
+                // Ordinary scrolling across a page boundary. Reordering rather
+                // than flushing gives viewport-local pages their priority without
+                // discarding work that is about to be needed anyway.
                 renderQueue.reprioritize(getCurrentCenterImageIndex());
             }
 
@@ -1314,7 +1267,7 @@
             if (!raw) return;
             const data = JSON.parse(raw);
 
-            // Automatically expire reading progress after 24 hours
+            // Automatically expire reading progress
             if (data.savedAt && (Date.now() - data.savedAt > 24 * 60 * 60 * 1000)) {
                 localStorage.removeItem(getPosKey());
                 return;
@@ -1551,13 +1504,9 @@
         savePosition();
         syncVideoPlayback();
 
-        /* Re-order what is already queued for where we just landed.
-           This has to happen now rather than in the debounced preload pass below:
-           a burst of single-page turns never trips the flush threshold above, so
-           without it the page now on screen stays behind everything that was
-           queued for the page we started from — several renders' worth of wait
-           on a fast flick. Reordering is free, and unlike a flush it keeps the
-           preload work that is still useful. */
+        /* Re-order what is already queued for where we just landed. This has to
+           happen now rather than in the debounced preload pass below: a burst of
+           single-page turns never trips the flush threshold above. */
         renderQueue.reprioritize(getCurrentCenterImageIndex());
 
         /* Debounce preloading: only fire 200ms after the last navigation event.
@@ -1570,21 +1519,18 @@
     /**
      * Does this image still need loading?
      *
-     * An empty src means it was never loaded or was purged. A `stale` marker
-     * means it is loaded but at the wrong size for the current layout, so it
-     * should be re-rendered — while continuing to show its existing pixels until
-     * the replacement is decoded and ready to swap in.
+     * An empty src means never loaded or purged. A `stale` marker means loaded at
+     * the wrong size, so it should be re-rendered while continuing to show its
+     * existing pixels until the replacement is ready.
      */
     function needsLoad(img) {
         return !img.src || img.dataset.stale === '1';
     }
 
     /**
-     * Re-rendering only ever buys sharpness, never correctness — the layout is
-     * pure CSS and follows the window on its own. A page is worth redoing only
-     * when the box it has to fill has outgrown the pixels we rendered for it.
-     * Below this ratio the difference is invisible, and re-rendering every page
-     * for a one-pixel drag is pure waste.
+     * Re-rendering only buys sharpness, never correctness — layout is pure CSS.
+     * A page is worth redoing only when its box has outgrown the pixels rendered
+     * for it. Below this ratio the difference is invisible.
      */
     const RERENDER_GROWTH_THRESHOLD = 1.05;
 
@@ -1593,20 +1539,13 @@
      * they occupy, without clearing what is on screen.
      *
      * purgeRenderCache() empties every src, which is right for a layout-mode
-     * switch — the whole track is being rebuilt — but wrong for a window resize.
-     * Blanking a page that is being looked at leaves a visible hole for as long
-     * as the re-decode takes, and every load path is guarded on `src` being
-     * empty, so clearing it is otherwise the only way to make a page reload.
-     * Marking instead lets smartLoadImage do its usual decode-then-swap, which
-     * never shows an empty frame.
+     * switch but wrong for a resize: blanking a visible page leaves a hole for as
+     * long as the re-decode takes. Marking lets smartLoadImage do its usual
+     * decode-then-swap instead.
      *
-     * Shrinking the window marks nothing: a render made for a bigger box still
-     * has more pixels than the smaller one needs, and the GPU downscales it for
-     * free. Pages already served at native resolution are never marked either,
-     * since no re-render can add detail that is not in the file.
-     *
-     * Videos are deliberately untouched: object-fit rescales them for free, and
-     * reloading one would restart playback on every resize event.
+     * Shrinking the window marks nothing, and pages already at native resolution
+     * are never marked. Videos are untouched, since object-fit rescales them for
+     * free and reloading would restart playback.
      *
      * @returns {number} how many pages were marked
      */
@@ -1821,11 +1760,10 @@
     /**
      * Cached layout measurements for the zoom path.
      *
-     * applyScale() and dragZoom() run on every mousemove of a zoom or pan drag.
-     * Reading getBoundingClientRect() and especially readingTrack.scrollWidth
-     * there forces a synchronous layout of the whole track on each event, which
-     * is what made rapid zoom drags stutter. These are refreshed whenever the
-     * layout actually changes instead.
+     * applyScale() and dragZoom() run on every mousemove. Reading
+     * getBoundingClientRect() or readingTrack.scrollWidth there forces a
+     * synchronous layout of the whole track, so these are refreshed on layout
+     * changes instead.
      */
     let cachedTrackScrollWidth = 0;
     /** Any animated image currently in the track? Avoids a per-event DOM query. */
@@ -1837,9 +1775,7 @@
 
     /**
      * Viewport box, without forcing a layout when the size is already known.
-     * calculateView() records it in rightSize on every layout change, so the
-     * per-mousemove zoom path can read that instead of calling
-     * getBoundingClientRect() on every event.
+     * calculateView() records it in rightSize on every layout change.
      */
     function viewportRect() {
         if (rightSize.width > 0 && rightSize.height > 0) {
@@ -1850,12 +1786,9 @@
     }
 
     /**
-     * Opt-in zoom profiler.
-     *
-     * Run `cbzProfileZoom()` in the console, do one zoom drag, and it reports
-     * where the time actually went: how long applyScale took per event, how many
-     * frames were dropped, and any long task the browser recorded. Guessing at
-     * compositor behaviour from symptoms is unreliable — this measures it.
+     * Opt-in zoom profiler. Run `cbzProfileZoom()` in the console, do one zoom
+     * drag, and it reports per-event applyScale time, dropped frames, and any
+     * long task the browser recorded.
      */
     let profiling = null;
     window.cbzProfileZoom = function (seconds) {
@@ -1958,20 +1891,16 @@
             const absY = (scrollBefore + fY) / prevScale;
             const newAbsY = absY * currentScale;
 
-            // X: transform handles horizontal offset.
-            // Two-path algorithm (adapted from OpenComic):
+            // X: transform handles horizontal offset. Two-path algorithm
+            // (adapted from OpenComic):
             //
-            // ZOOM IN  → focal-point math: shift zoomTx so the pixel under the cursor stays fixed.
-            //   addX = distance from viewport center to focal point (signed, in content-space).
-            //   The new offset accumulates the previous offset (rescaled up) plus the focal contribution.
+            // ZOOM IN  → focal-point math: shift zoomTx so the pixel under the
+            //   cursor stays fixed.
+            // ZOOM OUT → proportional scale-down: prevTx * (scale - 1) / (prevScale - 1),
+            //   so zoomTx converges to 0 at scale=1 with no snap.
             //
-            // ZOOM OUT → proportional scale-down: as scale shrinks toward 1, zoomTx shrinks toward 0.
-            //   Formula: prevTx * (scale - 1) / (prevScale - 1).
-            //   At scale=1 the numerator is 0, so zoomTx converges to 0 with no snap.
-            //
-            // Both paths are then clamped by notCrossZoomLimitsX which returns 0 when the image
-            // fits the viewport (no overflow) and ±maxTx when it overflows — so pan locking and
-            // pan panning are handled by the same clamping step, never by a hard if/else snap.
+            // Both paths are clamped by notCrossZoomLimitsX, which returns 0 when
+            // the image fits the viewport and ±maxTx when it overflows.
 
             const zoomingOut = currentScale < prevScale;
 
@@ -2052,23 +1981,17 @@
             readingBody.style.height = '100%';
         }
 
-        // --- Hardware Rasterization Kick for Animated Images ---
-        // The compositor texture that blurs on zoom is on readingTrack, not on .r-flex.
+        // --- Hardware rasterization kick for animated images ---
+        // The compositor texture that blurs on zoom is on readingTrack, not on
+        // .r-flex: in paged mode readingTrack has its own layer and Chromium
+        // magnifies its frozen texture; in continuous mode the scale is applied to
+        // readingTrack directly, with the same result.
         //
-        // In PAGED mode: readingBody gets scale(N) for zoom; readingTrack is a child that has its
-        //   own compositor layer (CSS: will-change: transform on .slide-layout). When readingBody is
-        //   zoomed, Chromium simply magnifies readingTrack's existing frozen texture → blurry.
+        // Fix (per Chrome docs): remove will-change from readingTrack before the
+        // scale is committed, so Chrome re-rasterizes at the new resolution, then
+        // re-add it in a double-RAF so panning still uses the GPU.
         //
-        // In CONTINUOUS mode: the zoom scale is applied directly on readingTrack.style.transform.
-        //   Same problem — readingTrack's own layer is frozen and just scaled up.
-        //
-        // Fix (per Chrome docs): temporarily remove will-change from readingTrack BEFORE the scale
-        //   is committed to the compositor. Without will-change, Chrome re-rasterizes the layer at
-        //   the new effective display resolution instead of stretching the frozen bitmap.
-        //   Re-add will-change in a double-RAF so that subsequent smooth panning still uses the GPU.
-        //
-        // Only run when scale actually changes (not on pan-only calls) and not during a navigation
-        // slide animation (where readingTrack needs its compositor layer for smooth 60fps scrolling).
+        // Only when scale actually changes, and not during a navigation slide.
         if (prevScale !== currentScale) {
             if (hasAnimatedImages && !slideAnimationRaf) {
                 readingTrack.style.willChange = 'auto'; // Override CSS will-change: transform → de-freeze layer
@@ -2101,18 +2024,13 @@
 
     /**
      * De-promote readingTrack/readingBody from their compositor layer just long
-     * enough for a hi-res swap to repaint at the current effective resolution,
-     * then re-promote.
+     * enough for a hi-res swap to repaint at the current resolution, then
+     * re-promote.
      *
-     * Coalesced across the whole hi-res pass rather than toggled per-image: in
-     * double-page mode the two pages finish their resize at different times
-     * (decode cost depends on each page's own size/complexity), and toggling
-     * these shared ancestors independently for each one means page A's swap
-     * forces a second, later repaint of page B too — a page that was already
-     * sharp and didn't need one. That second, out-of-sync repaint is what turns
-     * a single settle into two, which is what a jiggle looks like. Reusing one
-     * detach/reattach window for every swap that lands within a couple of
-     * frames of each other keeps it to one repaint per pass.
+     * Coalesced across the whole hi-res pass rather than per-image: in
+     * double-page mode the two pages finish at different times, and toggling
+     * independently would force a second repaint of a page that was already
+     * sharp — which is what a jiggle looks like.
      */
     let trackDetachedForHiRes = false;
     let trackReattachRaf1 = 0;
@@ -2136,8 +2054,7 @@
 
     /**
      * Promote a decoded hi-res frame into the visible <img> without a synchronous
-     * layout flush. offsetHeight during swap was a major source of drag stutter
-     * and occasional post-zoom nudges when the track was re-measured mid-gesture.
+     * layout flush. offsetHeight during swap was a major source of drag stutter.
      */
     function commitHiResImage(img, url) {
         const wrap = img.closest('.r-img > div');
@@ -2589,12 +2506,9 @@
     /**
      * Re-render at the new window size, once the user stops dragging.
      *
-     * Split from the layout work below on purpose. A drag-resize fires `resize`
-     * continuously, and re-rasterising every page on every one of those events
-     * is both wasteful and self-defeating — each pass cancels the last via
-     * renderEpoch, so a slow drag could leave nothing finished. Layout stays
-     * immediate so the page keeps tracking the window; only the expensive
-     * re-render waits for things to settle.
+     * A drag-resize fires `resize` continuously, and each pass cancels the last
+     * via renderEpoch, so a slow drag could leave nothing finished. Layout stays
+     * immediate; only the re-render waits for things to settle.
      */
     let resizeRenderTimer = 0;
     const RESIZE_SETTLE_MS = 180;
@@ -2620,11 +2534,9 @@
             goToIndex(currentIndex, false);
         }
 
-        // Zoom survives a resize. The pan offset is in layout pixels, so a new
-        // viewport can put it out of range; re-applying the same scale runs the
-        // clamp in applyScale against the new bounds and re-commits the
-        // transform. Dropping to 1x instead — which is what this used to do —
-        // threw away the reader's position for a one-pixel drag.
+        // Zoom survives a resize. The pan offset is in layout pixels, so
+        // re-applying the same scale runs the clamp in applyScale against the new
+        // bounds and re-commits the transform.
         if (haveZoom) applyScale(currentScale, false);
 
         // Deferred: re-render anything the resize left under-resolved.

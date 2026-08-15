@@ -1,11 +1,9 @@
 /**
  * Eagle format extension thumbnail: first page from a CBZ/CBR.
  *
- * Only the first entry is extracted — the archive is never fully decompressed.
- * If that entry is a video, its first frame is grabbed with the ffmpeg binary
- * provided by Eagle's FFmpeg dependency module (declared in manifest.json).
- * When that module is not installed we fall back to the first still image, so
- * thumbnails keep working either way.
+ * Only the first entry is extracted. If it is a video, its first frame is
+ * grabbed with Eagle's ffmpeg module; without that module we fall back to the
+ * first still image.
  */
 const fs = require('fs');
 const path = require('path');
@@ -50,9 +48,8 @@ module.exports = async ({ src, dest, item, extraModule }) => {
         item.width = size.width || item.width;
         return item;
     } finally {
-        // Thumbnailing opens an archive session (temp dir + a file handle kept open
-        // for fast page seeks). Release it immediately — a library import can queue
-        // thousands of these, and leaked descriptors would eventually break Eagle.
+        // Release the archive session immediately — a library import can queue
+        // thousands of these.
         try { archive.cleanup(src); } catch (_) { }
     }
 };
