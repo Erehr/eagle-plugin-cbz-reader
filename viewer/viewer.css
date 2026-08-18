@@ -580,37 +580,6 @@ body {
     object-fit: fill;
 }
 
-/* ── Video entries ──────────────────────────────────────────── */
-.reading-body .r-img video[data-is-video] {
-    display: block;
-    width: 100%;
-    height: auto;
-    max-width: 100%;
-    max-height: 100%;
-    box-sizing: border-box;
-    object-fit: contain;
-    min-width: 0;
-    min-height: 0;
-    pointer-events: none;
-    user-select: none;
-    -webkit-user-drag: none;
-    border: none;
-    outline: none;
-    /* Suppress any browser-default video chrome */
-    -webkit-media-controls: none;
-}
-
-/* Gap support: same inward padding as images */
-.reading-body #reading-track.track-has-gap .r-img video[data-is-video] {
-    padding: 4px;
-}
-
-/* Disable aggressive compositor layer for video containers to prevent texture glitches */
-.reading-body .r-flex:has(video[data-is-video]) {
-    will-change: auto !important;
-    transform: none !important;
-}
-
 /* Uniform gap: padding on the img shrinks it inward without changing any layout dimensions */
 .reading-body #reading-track.track-has-gap .r-img img {
     padding: 4px;

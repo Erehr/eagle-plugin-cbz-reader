@@ -171,26 +171,12 @@
     const DEFAULT_ASPECT = 0.69;
 
     const archiveUtil = require('../js/archive-util.js');
-    const VIDEO_EXT_SET = new Set(archiveUtil.VIDEO_EXT.map(e => e.toLowerCase()));
 
     /**
      * Identity of the archive session this viewer opened. Passed back to cleanup()
      * so a viewer closing late cannot delete another viewer's temp files.
      */
     let sessionToken = null;
-
-    function isVideoEntry(index) {
-        const name = imageNames[index] || '';
-        const ext = name.substring(name.lastIndexOf('.')).toLowerCase();
-        return VIDEO_EXT_SET.has(ext);
-    }
-
-    function isVideoPath(fp) {
-        const ext = fp.substring(fp.lastIndexOf('.')).toLowerCase();
-        return VIDEO_EXT_SET.has(ext);
-    }
-
-
 
     function getAspectRatio(imageIndex) {
         const d = imagesData[imageIndex];
@@ -201,16 +187,13 @@
     function loadImageSrc(index) {
         return archiveUtil.getImagePath(filePath, index).then(fp => {
             if (!fp) throw new Error('No path for page ' + index);
-            // Skip dimension update for video entries — their real dims come from loadedmetadata
-            if (!isVideoEntry(index)) {
-                const dims = archiveUtil.getImageDimensions(filePath, [index]);
-                if (dims && dims[0] && dims[0].width > 0) {
-                    imagesData[index] = {
-                        width: dims[0].width,
-                        height: dims[0].height,
-                        aspectRatio: dims[0].width / dims[0].height
-                    };
-                }
+            const dims = archiveUtil.getImageDimensions(filePath, [index]);
+            if (dims && dims[0] && dims[0].width > 0) {
+                imagesData[index] = {
+                    width: dims[0].width,
+                    height: dims[0].height,
+                    aspectRatio: dims[0].width / dims[0].height
+                };
             }
             return toFileURL(fp);
         });
@@ -251,7 +234,7 @@
     let rFlexEls = [];
     let mediaEls = [];
 
-    // Build DOM: one .r-flex per image/video, same for all modes
+    // Build DOM: one .r-flex per image, same for all modes
     function addHtmlImages() {
         const n = imageNames.length;
 
@@ -272,28 +255,13 @@
             rImg.dataset.index = String(i);
             const wrap = document.createElement('div');
 
-            if (isVideoEntry(i)) {
-                // Video entry: create a <video> that loops silently with no controls
-                const vid = document.createElement('video');
-                vid.dataset.index = String(i);
-                vid.dataset.isVideo = '1';
-                vid.autoplay = true;
-                vid.loop = true;
-                vid.muted = true;
-                vid.playsInline = true;
-                vid.controls = false;
-                vid.preload = 'none';
-                wrap.appendChild(vid);
-                mediaEls[i] = vid;
-            } else {
-                const img = document.createElement('img');
-                img.alt = '';
-                img.dataset.index = String(i);
-                img.loading = 'eager';
-                img.decoding = 'async';
-                wrap.appendChild(img);
-                mediaEls[i] = img;
-            }
+            const img = document.createElement('img');
+            img.alt = '';
+            img.dataset.index = String(i);
+            img.loading = 'eager';
+            img.decoding = 'async';
+            wrap.appendChild(img);
+            mediaEls[i] = img;
 
             rImg.appendChild(wrap);
             rFlex.appendChild(rImg);
@@ -306,6 +274,10 @@
 
         readingTrack.classList.toggle('track-has-gap', scrollGap);
         hasAnimatedImages = false;
+        // Every element in the track is new, so nothing recorded before this
+        // point refers to anything that still exists.
+        residentPages.clear();
+        residentBytes = 0;
         lazyLoadObserver();
     }
 
@@ -487,74 +459,6 @@
         return true;
     }
 
-    /** Set the source of a video element */
-    async function smartLoadVideo(vid, absolutePath, taskEpoch) {
-        // Use dataset.loaded as the guard — NOT vid.src. Chromium resolves the
-        // .src property to the page base URL when the attribute is empty, making
-        // `if (vid.src)` always truthy after a purge.
-        if (vid.dataset.loaded === '1') return;
-
-        const url = toFileURL(absolutePath);
-
-        // Final safety abort before mutating DOM
-        if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
-
-        // Listen for real dimensions once the browser parses the video header.
-        // This fires quickly (no need to decode any video frames) and gives us the
-        // true AR so we can reflow the layout beyond the 16:9 Node-side placeholder.
-        vid.addEventListener('loadedmetadata', () => {
-            const vw = vid.videoWidth;
-            const vh = vid.videoHeight;
-            if (vw && vh) {
-                const idx = parseInt(vid.dataset.index, 10);
-                if (!isNaN(idx)) {
-                    imagesData[idx] = { width: vw, height: vh, aspectRatio: vw / vh };
-                }
-                // Recompute layout now that we have the real aspect ratio
-                disposeImages();
-                if (continuous) calculateView(false);
-            }
-        }, { once: true });
-
-        vid.src = url;
-        vid.load();
-
-        // Only auto-play if this video is in the currently visible spread.
-        // Preloaded videos start paused to avoid decoding dozens of videos simultaneously.
-        const vidIdx = parseInt(vid.dataset.index, 10);
-        const currentSpread = getSpreadAt(currentIndex - 1) || [];
-        const isCurrentSpread = !isNaN(vidIdx) && currentSpread.some(s => s.index === vidIdx);
-        if (isCurrentSpread) {
-            vid.play().catch(() => { });
-        }
-
-        vid.dataset.loaded = '1';
-
-        // Initial layout pass with placeholder AR (will be corrected by loadedmetadata above)
-        requestAnimationFrame(() => { disposeImages(); });
-    }
-
-    /**
-     * Pause all video elements that are NOT in the current visible spread,
-     * and resume the one(s) that ARE. Called on every page-change event.
-     */
-    function syncVideoPlayback() {
-        const currentSpread = getSpreadAt(currentIndex - 1) || [];
-        const currentIndices = new Set(currentSpread.map(s => s.index));
-
-        for (let idx = 0, len = mediaEls.length; idx < len; idx++) {
-            const vid = mediaEls[idx];
-            if (!vid || vid.tagName !== 'VIDEO') continue;
-            if (vid.dataset.loaded !== '1') continue; // not yet loaded, skip
-
-            if (currentIndices.has(idx)) {
-                if (vid.paused) vid.play().catch(() => { });
-            } else {
-                if (!vid.paused) vid.pause();
-            }
-        }
-    }
-
     /**
      * Produce (or reuse) a downscaled copy of a page at `pxWidth`.
      *
@@ -677,6 +581,7 @@
             // Now rendered at the current layout size, so no longer stale
             img.dataset.stale = '';
             img.dataset.renderedW = String(renderedWidth);
+            markPageResident(imageIndex, img);
             if (isAnimated) {
                 img.dataset.animated = "1";
                 hasAnimatedImages = true;
@@ -691,6 +596,7 @@
             if (taskEpoch !== undefined && taskEpoch !== renderEpoch) return;
             img.src = url;
             img.dataset.stale = '';
+            markPageResident(imageIndex, img);
         }
     }
 
@@ -700,15 +606,11 @@
             for (const e of entries) {
                 if (!e.isIntersecting) continue;
                 const wrap = e.target;
-                // Support both <img> and <video> media elements
-                const vid = wrap.querySelector('video[data-is-video]');
-                const img = vid ? null : (wrap.tagName === 'IMG' ? wrap : wrap.querySelector('img'));
-                const mediaEl = vid || img;
-                if (!mediaEl) continue;
+                const img = wrap.tagName === 'IMG' ? wrap : wrap.querySelector('img');
+                if (!img) continue;
                 // Skip if already loaded
-                if (vid && vid.dataset.loaded) continue;
-                if (img && !needsLoad(img)) continue;
-                const idx = parseInt(mediaEl.dataset.index, 10);
+                if (!needsLoad(img)) continue;
+                const idx = parseInt(img.dataset.index, 10);
                 if (isNaN(idx)) continue;
                 // The queue applies the distance term itself, against whatever
                 // the centre is at the time — including after a reprioritize.
@@ -718,8 +620,7 @@
                     const currentDist = Math.abs(idx - getCurrentCenterImageIndex());
                     if (currentDist > 15) return;
 
-                    if (vid && vid.dataset.loaded) return;
-                    if (img && !needsLoad(img)) return;
+                    if (!needsLoad(img)) return;
 
                     try {
                         const fp = await archiveUtil.getImagePath(filePath, idx, abortToken);
@@ -727,35 +628,29 @@
                         if (taskEpoch !== renderEpoch) return;
 
                         const dims = archiveUtil.getImageDimensions(filePath, [idx]);
-                        // Skip dimension update for video entries — their real dims come from loadedmetadata
-                        if (!isVideoEntry(idx) && dims && dims[0] && dims[0].width > 0) {
+                        if (dims && dims[0] && dims[0].width > 0) {
                             imagesData[idx] = { width: dims[0].width, height: dims[0].height, aspectRatio: dims[0].width / dims[0].height };
                         }
 
-                        if (vid) {
-                            await smartLoadVideo(vid, fp, taskEpoch);
-                        } else {
-                            if (img.dataset.index !== String(idx) || !needsLoad(img)) return;
-                            if (idx === 0) {
-                                img.addEventListener('load', function onFirstLoad() {
-                                    img.removeEventListener('load', onFirstLoad);
-                                    const w = img.closest('.r-img > div');
-                                    if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
-                                });
-                            }
-                            await smartLoadImage(img, fp, taskEpoch);
-                            if (img.decode) {
-                                try { await img.decode(); } catch (_) { }
-                            }
+                        if (img.dataset.index !== String(idx) || !needsLoad(img)) return;
+                        if (idx === 0) {
+                            img.addEventListener('load', function onFirstLoad() {
+                                img.removeEventListener('load', onFirstLoad);
+                                const w = img.closest('.r-img > div');
+                                if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
+                            });
+                        }
+                        await smartLoadImage(img, fp, taskEpoch);
+                        if (img.decode) {
+                            try { await img.decode(); } catch (_) { }
                         }
                         scheduleDisposeAfterLoad();
                     } catch (e) {
-                        console.error('Failed to load media ' + idx, e);
+                        console.error('Failed to load page ' + idx, e);
                     }
                 });
             }
         }, { root: readingContainer, rootMargin: '2000px', threshold: 0 });
-        // Observe both img and video wraps
         readingTrack.querySelectorAll('.r-img > div').forEach(wrap => {
             imgObserver.observe(wrap);
         });
@@ -831,10 +726,9 @@
         const wrap = rImg.querySelector(':scope > div');
         if (!wrap) return;
 
-        const vid = wrap.querySelector('video[data-is-video]');
-        const img = vid ? null : wrap.querySelector('img');
+        const img = wrap.querySelector('img');
         const isAnimated = img && img.dataset.animated === '1';
-        const isFlexible = isAnimated; // Only animated WebP needs responsive sizing; videos use exact px like static images
+        const isFlexible = isAnimated; // Only animated WebP needs responsive sizing
 
         if (isFlexible) {
             // For animated WebP: set both an explicit pixel size AND maintain max-bounds so
@@ -849,21 +743,14 @@
             img.style.maxWidth = w + 'px';
             img.style.maxHeight = h + 'px';
         } else {
-            // Static images AND videos: lock to exact pixel bounds.
-            // For images, the AR was read from the file so w/h already match exactly.
-            // For videos, object-fit:contain (CSS) handles any AR mismatch without distortion.
+            // Static images: lock to exact pixel bounds. The AR was read from the
+            // file, so w/h already match exactly.
             wrap.style.width = w + 'px';
             wrap.style.height = h + 'px';
             wrap.style.maxWidth = w + 'px';
             wrap.style.maxHeight = h + 'px';
             wrap.style.margin = '0';
-            if (vid) {
-                vid.style.width = w + 'px';
-                vid.style.height = h + 'px';
-                vid.style.maxWidth = w + 'px';
-                vid.style.maxHeight = h + 'px';
-                vid.style.display = 'block';
-            } else if (img) {
+            if (img) {
                 img.style.width = w + 'px';
                 img.style.height = h + 'px';
                 img.style.maxWidth = w + 'px';
@@ -1227,7 +1114,6 @@
 
             updatePageInfo();
             preloadImagesAroundCurrent();
-            syncVideoPlayback();
         }
         /* Keep preload pipeline full: run again after short delay so ahead images are requested early */
         clearTimeout(scrollPreloadTimer);
@@ -1332,16 +1218,149 @@
     const MAX_PREV = 5;
     const MAX_NEXT = 15;
 
+    // ── Resident page window ─────────────────────────────────────────────
+    /**
+     * A loaded <img> holds its decoded bitmap for as long as its src is set, and
+     * nothing in the track is ever removed, so without a cap a long archive grows
+     * monotonically: read 400 pages of a 2000-page CBZ and 400 decoded pages are
+     * still resident. The track keeps its full DOM — layout depends on it — but
+     * only a window around the reader keeps pixels.
+     *
+     * Two rules, because either alone has a failure case. The page window is what
+     * usually applies, but a handful of 8000px scans blows past any sane memory
+     * ceiling well inside it; the byte budget catches those. Conversely a byte
+     * budget alone would let hundreds of small pages stay resident for no
+     * benefit, so the window bounds them too.
+     */
+    /** Keep pixels for this many pages behind / ahead: twice the preload window. */
+    const KEEP_LOADED_PREV = MAX_PREV * 2;
+    const KEEP_LOADED_NEXT = MAX_NEXT * 2;
+    /** Ceiling on estimated decoded bitmap bytes across all loaded pages. */
+    const RESIDENT_BYTE_BUDGET = 768 * 1024 * 1024;
+    /** Pages this close to the centre are never evicted by the byte rule. */
+    const RESIDENT_PROTECT = 3;
+    /** Never evict below this many pages, whatever the budget says. */
+    const MIN_RESIDENT_PAGES = 4;
+    /** Assumed width for a page whose real dimensions are not known yet. */
+    const ASSUMED_PAGE_WIDTH = 1500;
+
+    /** index → estimated decoded bytes, for every page currently holding pixels */
+    const residentPages = new Map();
+    let residentBytes = 0;
+    let residentEnforceTimer = 0;
+
+    /**
+     * Decoded size of what is actually in the element, not of the source file.
+     *
+     * `renderedW` is the pixel width smartLoadImage put there, which is the
+     * downscaled width in the common case; Infinity means the original file was
+     * used, so fall back to the page's native width.
+     */
+    function estimatePageBytes(idx, img) {
+        const d = imagesData[idx];
+        const ar = (d && d.aspectRatio) || DEFAULT_ASPECT;
+        let w = img ? parseFloat(img.dataset.renderedW) : NaN;
+        if (!isFinite(w) || !(w > 0)) w = (d && d.width) || 0;
+        if (!(w > 0)) w = ASSUMED_PAGE_WIDTH;
+        const h = Math.max(1, Math.round(w / (ar || DEFAULT_ASPECT)));
+        return w * h * 4; // RGBA
+    }
+
+    /** Record (or re-record, after a resize re-render) a page as holding pixels. */
+    function markPageResident(idx, img) {
+        if (idx === undefined || isNaN(idx)) return;
+        const prev = residentPages.get(idx);
+        if (prev !== undefined) residentBytes -= prev;
+        const bytes = estimatePageBytes(idx, img);
+        residentPages.set(idx, bytes);
+        residentBytes += bytes;
+        scheduleResidentEnforce();
+    }
+
+    /**
+     * Give a page's pixels back.
+     *
+     * Layout is untouched: the wrapper keeps its computed width/height and
+     * imagesData keeps the aspect ratio, so the strip does not move. Clearing
+     * `stale` matters — an absent src already means "needs loading", and leaving
+     * the marker set would make needsLoad() double-count.
+     */
+    function unloadPage(idx) {
+        const bytes = residentPages.get(idx);
+        if (bytes !== undefined) {
+            residentPages.delete(idx);
+            residentBytes = Math.max(0, residentBytes - bytes);
+        }
+        const img = mediaEls[idx];
+        if (!img) return;
+        // removeAttribute rather than src='': an empty string resolves to the
+        // page URL and would fire a bogus load.
+        img.removeAttribute('src');
+        img.dataset.renderedW = '';
+        img.dataset.stale = '';
+        img.dataset.hiRes = '';
+    }
+
+    /**
+     * Bring the resident set back inside both limits, furthest page first.
+     *
+     * @param {number} [center] centre page; defaults to the current spread
+     */
+    function enforceResidentBudget(center) {
+        if (residentPages.size === 0) return;
+        const c = (center === undefined || isNaN(center)) ? getCurrentCenterImageIndex() : center;
+
+        // 1. Page window. Asymmetric, matching the preload window: reading
+        //    forwards is the common case, so more is kept ahead than behind.
+        for (const idx of [...residentPages.keys()]) {
+            const delta = idx - c;
+            if (delta < -KEEP_LOADED_PREV || delta > KEEP_LOADED_NEXT) unloadPage(idx);
+        }
+
+        // 2. Byte budget, for when the surviving pages are individually huge.
+        if (residentBytes <= RESIDENT_BYTE_BUDGET) return;
+        const candidates = [...residentPages.keys()]
+            .filter(idx => Math.abs(idx - c) > RESIDENT_PROTECT)
+            .sort((a, b) => Math.abs(b - c) - Math.abs(a - c));
+        for (const idx of candidates) {
+            if (residentBytes <= RESIDENT_BYTE_BUDGET) break;
+            if (residentPages.size <= MIN_RESIDENT_PAGES) break;
+            unloadPage(idx);
+        }
+    }
+
+    /**
+     * Coalesce enforcement across a burst of loads.
+     *
+     * A preload pass finishes several pages within a few hundred ms, and running
+     * the sweep once at the end is both cheaper and less likely to evict a page
+     * that a still-running task is about to want.
+     */
+    function scheduleResidentEnforce() {
+        if (residentEnforceTimer) return;
+        residentEnforceTimer = setTimeout(() => {
+            residentEnforceTimer = 0;
+            enforceResidentBudget();
+        }, 250);
+    }
+
+    /** Console helper: `cbzMemory()` reports what the reader is currently holding. */
+    window.cbzMemory = function () {
+        const mb = residentBytes / (1024 * 1024);
+        const idxs = [...residentPages.keys()].sort((a, b) => a - b);
+        console.log('[cbz-reader] resident pages: ' + residentPages.size + '/' + imageNames.length +
+            '   est. ' + mb.toFixed(1) + ' MB of ' + (RESIDENT_BYTE_BUDGET / 1024 / 1024) + ' MB' +
+            '   centre ' + getCurrentCenterImageIndex() +
+            '   range ' + (idxs.length ? idxs[0] + '..' + idxs[idxs.length - 1] : 'none'));
+        return { pages: residentPages.size, bytes: residentBytes, indices: idxs };
+    };
+
     function applyPathMapToDom(pathMap, center, priority) {
         if (!pathMap || pathMap.size === 0) return;
         const resolvedIndices = [...pathMap.keys()];
         const dims = archiveUtil.getImageDimensions(filePath, resolvedIndices);
         if (dims && dims.length === resolvedIndices.length) {
             resolvedIndices.forEach((idx, i) => {
-                // Skip video entries — their real dims come from the loadedmetadata browser event.
-                // Writing the Node-side 16:9 placeholder here would overwrite the real AR
-                // and cause a snap-back 200-500ms after navigation when the preloader fires.
-                if (isVideoEntry(idx)) return;
                 const d = dims[i];
                 if (d && d.width > 0 && d.height > 0) {
                     imagesData[idx] = {
@@ -1358,13 +1377,9 @@
         for (const idx of order) {
             const mediaPath = pathMap.get(idx);
             // Cached lookup – no full-track query per preload pass
-            const mediaEl = mediaEls[idx];
-            if (!mediaPath || !mediaEl) continue;
-            if (mediaEl.tagName === 'IMG') {
-                if (!needsLoad(mediaEl) || mediaEl.dataset.index !== String(idx)) continue;
-            } else if (mediaEl.dataset.loaded) {
-                continue;
-            }
+            const img = mediaEls[idx];
+            if (!mediaPath || !img) continue;
+            if (!needsLoad(img) || img.dataset.index !== String(idx)) continue;
 
             // Rank only — the queue applies the distance term itself, so this
             // stays correct after the reader moves and the queue is re-scored.
@@ -1373,34 +1388,24 @@
                 taskRank = RANK_CURRENT;
             }
 
-            const isVid = mediaEl.tagName === 'VIDEO';
-
             renderQueue.add(taskRank, idx, async (abortToken) => {
                 const taskEpoch = renderEpoch;
+                if (!needsLoad(img)) return;
 
-                if (isVid) {
-                    if (mediaEl.dataset.loaded) return;
-                    await smartLoadVideo(mediaEl, mediaPath, taskEpoch);
-                    scheduleDisposeAfterLoad();
-                } else {
-                    const img = mediaEl;
-                    if (!needsLoad(img)) return;
-
-                    if (idx === 0) {
-                        img.addEventListener('load', function clearThumbnailPlaceholder() {
-                            img.removeEventListener('load', clearThumbnailPlaceholder);
-                            const w = img.closest('.r-img > div');
-                            if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
-                        });
-                    }
-
-                    await smartLoadImage(img, mediaPath, taskEpoch);
-
-                    if (img.decode) {
-                        try { await img.decode(); } catch (_) { }
-                    }
-                    scheduleDisposeAfterLoad();
+                if (idx === 0) {
+                    img.addEventListener('load', function clearThumbnailPlaceholder() {
+                        img.removeEventListener('load', clearThumbnailPlaceholder);
+                        const w = img.closest('.r-img > div');
+                        if (w) { w.style.backgroundImage = ''; w.style.backgroundSize = ''; w.style.backgroundPosition = ''; w.style.backgroundRepeat = ''; }
+                    });
                 }
+
+                await smartLoadImage(img, mediaPath, taskEpoch);
+
+                if (img.decode) {
+                    try { await img.decode(); } catch (_) { }
+                }
+                scheduleDisposeAfterLoad();
             });
         }
     }
@@ -1409,6 +1414,11 @@
     function preloadImagesAroundCurrent() {
         const currentEpoch = renderEpoch;
         let center = getCurrentCenterImageIndex();
+
+        // Release what the reader has moved away from before asking for more, so
+        // the two never overlap at peak. Runs on every nav and scroll pass, which
+        // is exactly when the centre has moved.
+        enforceResidentBudget(center);
 
         // Track scroll momentum to bias preloading direction
         let scrollDirection = (center >= lastPreloadCenter) ? 1 : -1;
@@ -1502,7 +1512,6 @@
         updatePageInfo();
         updateNav();
         savePosition();
-        syncVideoPlayback();
 
         /* Re-order what is already queued for where we just landed. This has to
            happen now rather than in the debounced preload pass below: a burst of
@@ -1544,8 +1553,7 @@
      * decode-then-swap instead.
      *
      * Shrinking the window marks nothing, and pages already at native resolution
-     * are never marked. Videos are untouched, since object-fit rescales them for
-     * free and reloading would restart playback.
+     * are never marked.
      *
      * @returns {number} how many pages were marked
      */
@@ -1555,7 +1563,7 @@
 
         for (let i = 0, len = mediaEls.length; i < len; i++) {
             const el = mediaEls[i];
-            if (!el || el.tagName !== 'IMG' || !el.src) continue;
+            if (!el || !el.src) continue;
 
             const rendered = parseFloat(el.dataset.renderedW);
             // Unknown provenance (e.g. loaded before this bookkeeping existed):
@@ -1576,23 +1584,20 @@
         return marked;
     }
 
-    /** Drop every loaded media source so the new layout footprint is re-evaluated */
+    /** Drop every loaded image source so the new layout footprint is re-evaluated */
     function purgeRenderCache() {
         for (let i = 0, len = mediaEls.length; i < len; i++) {
             const el = mediaEls[i];
             if (!el) continue;
-            if (el.tagName === 'VIDEO') {
-                el.pause();
-                el.removeAttribute('src'); // removeAttribute avoids empty-string resolving to page URL
-                el.load();
-                delete el.dataset.loaded; // Remove entirely so the guard check works cleanly
-            } else {
-                el.src = '';
-                el.removeAttribute('src');
-                el.dataset.hiRes = '';
-                el.dataset.stale = ''; // empty src already means "needs loading"
-            }
+            el.removeAttribute('src'); // removeAttribute avoids empty-string resolving to page URL
+            el.dataset.hiRes = '';
+            el.dataset.renderedW = '';
+            el.dataset.stale = ''; // absent src already means "needs loading"
         }
+        // unloadPage() would repeat the work above one element at a time; the
+        // loop already cleared every element, so only the accounting is left.
+        residentPages.clear();
+        residentBytes = 0;
         renderQueue.clear();
         renderEpoch++;
     }
@@ -2667,19 +2672,12 @@
         if (idx < 0) return; // Not on an image
 
         e.preventDefault();
-        const isVid = isVideoEntry(idx);
-        const mediaLabel = isVid ? 'Video' : 'Image';
-        const menuItems = [
-            { id: 'save', label: `Save ${mediaLabel}`, click: () => saveImage(idx) },
-        ];
-        if (!isVid) {
-            menuItems.push({ id: 'copy', label: 'Copy Image', click: () => copyImage(idx) });
-        }
-        menuItems.push(
-            { id: 'unpack', label: `Unpack ${mediaLabel} to Eagle`, click: () => unpackImage(idx) },
+        eagle.contextMenu.open([
+            { id: 'save', label: 'Save Image', click: () => saveImage(idx) },
+            { id: 'copy', label: 'Copy Image', click: () => copyImage(idx) },
+            { id: 'unpack', label: 'Unpack Image to Eagle', click: () => unpackImage(idx) },
             { id: 'thumbnail', label: 'Set as Thumbnail', click: () => setAsThumbnail(idx) },
-        );
-        eagle.contextMenu.open(menuItems);
+        ]);
     }
 
     // Init

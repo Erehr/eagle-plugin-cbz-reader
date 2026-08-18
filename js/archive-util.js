@@ -3,12 +3,16 @@
  *
  * Lazy extraction to a temp directory: list entries once, extract images
  * on-demand in a window around the requested index, purge files beyond
- * ±PURGE_DISTANCE, and return file paths so the renderer can use file:// URLs.
+ * ±PURGE_DISTANCE (and above MAX_EXTRACTED_FILES however close they are), and
+ * return file paths so the renderer can use file:// URLs.
+ *
+ * Nothing here scales with archive length: temp-directory usage is bounded by
+ * the purge window, not by page count, so a 5000-page CBZ costs the same as a
+ * 50-page one.
  */
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawnSync } = require('child_process');
 
 const PLUGIN_ROOT = path.join(__dirname, '..');
 const requireYauzl = () => require(path.join(PLUGIN_ROOT, 'node_modules', 'yauzl'));
@@ -19,17 +23,30 @@ const renderImage = require(path.join(__dirname, 'render-image.js'));
 
 const IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'];
 const IMAGE_EXT_SET = new Set(IMAGE_EXT.map(e => e.toLowerCase()));
-const VIDEO_EXT = ['.mp4', '.webm'];
-const VIDEO_EXT_SET = new Set(VIDEO_EXT.map(e => e.toLowerCase()));
-/** All supported media extensions (images + videos) */
-const MEDIA_EXT = [...IMAGE_EXT, ...VIDEO_EXT];
+/** All supported media extensions. Kept as an alias so callers need not care. */
+const MEDIA_EXT = [...IMAGE_EXT];
 
 /** How many images ahead/behind to extract around the current page */
 const PRELOAD_AHEAD = 7;
-/** Purge extracted files further than this from the current page (keep plenty to avoid re-extract on back/forward) */
-const PURGE_DISTANCE = 80;
+/**
+ * Purge extracted files further than this from the current page.
+ *
+ * Sized at roughly twice the viewer's preload window (20 pages), which bounds
+ * the temp directory at ~90 pages however long the archive is. Large enough
+ * that ordinary back/forward reading never re-extracts, small enough that a
+ * 2000-page CBZ cannot fill the disk.
+ */
+const PURGE_DISTANCE = 45;
 /** Only run purge when center has moved at least this many pages from last purge (reduces unlink spam) */
-const PURGE_STEP = 25;
+const PURGE_STEP = 10;
+/**
+ * Hard ceiling on extracted pages, independent of distance.
+ *
+ * PURGE_DISTANCE alone bounds a linear read, but a reader who scrubs around
+ * accumulates pages faster than the throttled distance purge drops them. When
+ * this trips, the pages furthest from the current centre go first.
+ */
+const MAX_EXTRACTED_FILES = 2 * PURGE_DISTANCE + 8;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -44,14 +61,9 @@ function isMacResourceFork(name) {
     return base.startsWith('._');
 }
 
-function isVideoFileName(name) {
-    const ext = path.extname(name).toLowerCase();
-    return VIDEO_EXT_SET.has(ext) && !isMacResourceFork(name);
-}
-
 function isImageFileName(name) {
     const ext = path.extname(name).toLowerCase();
-    return (IMAGE_EXT_SET.has(ext) || VIDEO_EXT_SET.has(ext)) && !isMacResourceFork(name);
+    return IMAGE_EXT_SET.has(ext) && !isMacResourceFork(name);
 }
 
 function naturalSort(a, b) {
@@ -200,22 +212,51 @@ class ArchiveSession {
         return resolveInside(this.tmpDir, this.diskNameFor(entryName));
     }
 
-    /** Purge extracted files far from `centerIndex`. Throttled so we don't purge on every getImagePath. */
+    /** Drop one extracted page from disk and from the bookkeeping. */
+    _dropExtracted(idx) {
+        const filePath = this.extracted.get(idx);
+        if (filePath) { try { fs.unlinkSync(filePath); } catch (_) { } }
+        this.extracted.delete(idx);
+    }
+
+    /**
+     * Purge extracted files far from `centerIndex`.
+     *
+     * Two rules, both needed. The distance rule is throttled by PURGE_STEP so a
+     * page turn does not unlink on every call; the count rule is not, because it
+     * is the one that has to hold when the throttle is suppressing the first —
+     * scrubbing back and forth inside PURGE_STEP still extracts new pages, and
+     * without a ceiling they accumulate until the archive is exhausted.
+     */
     purge(centerIndex) {
-        if (this._lastPurgeCenter != null && Math.abs(centerIndex - this._lastPurgeCenter) < PURGE_STEP) {
-            return;
-        }
-        this._lastPurgeCenter = centerIndex;
-        for (const [idx, filePath] of this.extracted) {
-            if (Math.abs(idx - centerIndex) > PURGE_DISTANCE) {
-                try { fs.unlinkSync(filePath); } catch (_) { }
-                this.extracted.delete(idx);
+        const throttled = this._lastPurgeCenter != null
+            && Math.abs(centerIndex - this._lastPurgeCenter) < PURGE_STEP;
+
+        if (!throttled) {
+            this._lastPurgeCenter = centerIndex;
+            for (const idx of [...this.extracted.keys()]) {
+                if (Math.abs(idx - centerIndex) > PURGE_DISTANCE) this._dropExtracted(idx);
             }
         }
-        // Scaled renders belong to a page; drop them alongside their source
+
+        // Hard ceiling: evict furthest-first until back under the limit.
+        if (this.extracted.size > MAX_EXTRACTED_FILES) {
+            const byDistance = [...this.extracted.keys()]
+                .sort((a, b) => Math.abs(b - centerIndex) - Math.abs(a - centerIndex));
+            let over = this.extracted.size - MAX_EXTRACTED_FILES;
+            for (const idx of byDistance) {
+                if (over-- <= 0) break;
+                this._dropExtracted(idx);
+            }
+        }
+
+        // Scaled renders belong to a page; drop them alongside their source.
+        // A render whose source page is gone is dead weight regardless of distance.
         if (this._scaledCache) {
             for (const [key, entry] of this._scaledCache) {
-                if (entry && Math.abs(entry.index - centerIndex) > PURGE_DISTANCE) {
+                if (!entry) { this._scaledCache.delete(key); continue; }
+                if (Math.abs(entry.index - centerIndex) > PURGE_DISTANCE
+                    || !this.extracted.has(entry.index)) {
                     try { fs.unlinkSync(entry.path); } catch (_) { }
                     this._scaledCache.delete(key);
                 }
@@ -655,89 +696,13 @@ async function getImageBufferByIndex(filePath, index) {
 }
 
 /**
- * Extract the first frame of a video as a JPEG buffer.
- *
- * The ffmpeg binary comes from Eagle's FFmpeg dependency module rather than
- * being bundled, which keeps the plugin small and cross-platform.
- *
- * @param {string} videoPath - Absolute path to the extracted video file
- * @param {string} ffmpegBin - Absolute path to the ffmpeg executable
- * @returns {Buffer|null} null if ffmpeg is unavailable or extraction fails
- */
-function getVideoFrameBuffer(videoPath, ffmpegBin) {
-    if (!ffmpegBin) {
-        console.warn('[archive-util] no ffmpeg binary available, cannot extract video frame');
-        return null;
-    }
-
-    const outPath = videoPath + '.thumb.jpg';
-    try {
-        // Extract first key-frame as JPEG, timeout 10s
-        const result = spawnSync(
-            ffmpegBin,
-            [
-                '-y',                  // overwrite without prompting
-                '-i', videoPath,       // input
-                '-frames:v', '1',      // only one frame
-                '-q:v', '2',           // JPEG quality (2 = high)
-                '-f', 'image2',        // force image2 muxer
-                outPath
-            ],
-            { timeout: 10000, encoding: 'buffer' }
-        );
-
-        if (result.status !== 0 || !fs.existsSync(outPath)) {
-            return null;
-        }
-
-        const buf = fs.readFileSync(outPath);
-        try { fs.unlinkSync(outPath); } catch (_) { }
-        return buf;
-    } catch (err) {
-        console.error('[archive-util] ffmpeg frame extraction failed:', err);
-        try { fs.unlinkSync(outPath); } catch (_) { }
-        return null;
-    }
-}
-
-/**
  * Get the first image buffer (for thumbnail generation).
- * If the first entry is a video, extracts its first frame via ffmpeg.
- * Falls back to the first non-video entry if frame extraction fails.
  *
  * @param {string} filePath - archive path
- * @param {object} [opts]
- * @param {string} [opts.ffmpegPath] - ffmpeg executable from Eagle's FFmpeg module
  */
-async function getFirstImageBuffer(filePath, opts) {
+async function getFirstImageBuffer(filePath) {
     const names = await listImages(filePath);
     if (names.length === 0) throw new Error('No images found in archive');
-
-    const firstName = names[0];
-
-    if (isVideoFileName(firstName)) {
-        const ffmpegPath = opts && opts.ffmpegPath;
-        if (ffmpegPath) {
-            // Extract the video to temp dir first, then grab a frame from it
-            const videoPath = await getImagePath(filePath, 0);
-            if (videoPath) {
-                const frameBuf = getVideoFrameBuffer(videoPath, ffmpegPath);
-                if (frameBuf && frameBuf.length > 0) return frameBuf;
-            }
-        }
-
-        // ffmpeg unavailable or failed — fall back to first image entry
-        for (let i = 1; i < names.length; i++) {
-            if (!isVideoFileName(names[i])) {
-                return getImageBufferByIndex(filePath, i);
-            }
-        }
-        throw new Error(
-            'Archive contains only video entries. Install the FFmpeg plugin from the ' +
-            'Eagle Plugin Center to generate thumbnails from video frames.'
-        );
-    }
-
     return getImageBufferByIndex(filePath, 0);
 }
 
@@ -756,14 +721,6 @@ function getImageDimensions(filePath, indices) {
         if (session.dimensions.has(idx)) return session.dimensions.get(idx);
         const fp = session.extracted.get(idx);
         if (!fp) return null;
-
-        // Videos: image-size cannot read them – return a 16:9 placeholder so layout has an AR
-        const ext = path.extname(fp).toLowerCase();
-        if (VIDEO_EXT_SET.has(ext)) {
-            const result = { width: 1920, height: 1080 };
-            session.dimensions.set(idx, result);
-            return result;
-        }
 
         try {
             const dim = imageSize(fp);
@@ -967,8 +924,13 @@ function isAnimatedPage(session, index, filePath) {
     return info.animated;
 }
 
-/** How many scaled renders to keep on disk before evicting the oldest */
-const SCALED_CACHE_MAX = 140;
+/**
+ * How many scaled renders to keep on disk before evicting the oldest.
+ *
+ * Held below the extracted-page ceiling: a render is only useful while its
+ * source page is still around, and purge() drops orphans anyway.
+ */
+const SCALED_CACHE_MAX = 60;
 
 /**
  * Disk cache for downscaled pages, keyed by page + render-width bucket. Widths
@@ -1156,10 +1118,9 @@ module.exports = {
     cleanup,
     cleanupAll,
     isImageFileName,
-    isVideoFileName,
     IMAGE_EXT,
-    VIDEO_EXT,
     MEDIA_EXT,
     PRELOAD_AHEAD,
     PURGE_DISTANCE,
+    MAX_EXTRACTED_FILES,
 };

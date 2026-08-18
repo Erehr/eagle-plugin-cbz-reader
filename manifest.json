@@ -14,9 +14,6 @@
         "reader",
         "viewer"
     ],
-    "dependencies": [
-        "ffmpeg"
-    ],
     "devTools": false,
     "main": {
         "frame": false,
